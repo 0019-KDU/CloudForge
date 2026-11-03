@@ -1,0 +1,25 @@
+# Keep the build context small and free of local state and secrets.
+node_modules
+dist
+coverage
+.vite
+*.tsbuildinfo
+*.log
+
+# Local environment files may hold machine-specific values; the image is configured at build/run time.
+.env
+.env.*
+!.env.example
+
+# Editor, VCS and OS files
+.git
+.gitignore
+.idea
+.vscode
+*.swp
+.DS_Store
+Thumbs.db
+
+# Docker files themselves (the nginx configs under docker/ are needed and are not ignored)
+Dockerfile
+.dockerignore

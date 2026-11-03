@@ -1,0 +1,21 @@
+# Local development database only. This is not a deployment manifest.
+# Usage: copy .env.example to .env, set a password, then `docker compose up -d`.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: cloudforge
+      POSTGRES_USER: cloudforge
+      POSTGRES_PASSWORD: ${CLOUDFORGE_DB_PASSWORD:?Set CLOUDFORGE_DB_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - cloudforge-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloudforge -d cloudforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  cloudforge-pgdata:

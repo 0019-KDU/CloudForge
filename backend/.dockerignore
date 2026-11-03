@@ -1,0 +1,38 @@
+# Only what the Docker build needs goes into the build context: the Maven wrapper, pom.xml and src/.
+# Everything else is excluded, so secrets and local build output never reach an image layer.
+
+# Secrets: never send these to the Docker daemon
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+
+# Build output (the image builds its own jar from source)
+target/
+.mvn/wrapper/maven-wrapper.jar
+
+# IDE / OS / VCS
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+.git/
+.gitignore
+.gitattributes
+.DS_Store
+Thumbs.db
+
+# Docker and local-only files
+Dockerfile
+.dockerignore
+compose.yaml
+HELP.md
+*.log

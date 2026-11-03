@@ -1,0 +1,7 @@
+# Changes to CI, security tooling and their exceptions need an owner's review.
+# Takes effect when branch protection enables "Require review from Code Owners".
+# Replace the handle with a team (e.g. @org/platform) once the repository moves to an organization.
+
+/.github/            @0019-KDU
+/.gitleaks.toml      @0019-KDU
+/.trivyignore.yaml   @0019-KDU

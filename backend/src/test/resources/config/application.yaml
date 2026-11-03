@@ -1,0 +1,10 @@
+# Test-only overrides, merged on top of the main application.yaml (config/ has higher precedence).
+# This key exists only on the test classpath and signs tokens for tests. Never reuse it anywhere.
+cloudforge:
+  security:
+    jwt:
+      secret: RGoOPzViO8BrjQn9tBsqmFvIKtuB4jCu7/XDTbmgvV0=
+    # Most integration tests log in from MockMvc's default address (127.0.0.1); keep the per-client
+    # limit out of their way. SecurityHardeningIT tests the limit itself with a low value.
+    login-throttle:
+      max-attempts: 100000

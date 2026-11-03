@@ -1,0 +1,41 @@
+# Developer workstation profile: activate with SPRING_PROFILES_ACTIVE=local.
+# Starts against the PostgreSQL container from compose.yaml. The password is still read from the
+# environment (.env), so no credential is committed.
+spring:
+  config:
+    # Local secrets live in the git-ignored backend/.env (KEY=VALUE lines). Both paths are listed so it
+    # works whether the app is started from backend/ (mvnw) or from the repository root (IDE).
+    import:
+      - optional:file:.env[.properties]
+      - optional:file:backend/.env[.properties]
+  datasource:
+    url: ${CLOUDFORGE_DB_URL:jdbc:postgresql://localhost:5432/cloudforge}
+    username: ${CLOUDFORGE_DB_USERNAME:cloudforge}
+
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    enabled: true
+
+management:
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.cloudforge: DEBUG
+
+# Local development: run the provisioning worker against the simulated providers. Never set
+# mode: real here; real provisioning is configured per environment through environment variables.
+cloudforge:
+  provisioning:
+    worker:
+      enabled: true
+    aws:
+      mode: mock
+    gcp:
+      mode: mock
+    kubernetes:
+      mode: mock

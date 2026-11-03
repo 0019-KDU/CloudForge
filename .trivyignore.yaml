@@ -1,0 +1,14 @@
+# Trivy baseline: known findings that are tracked, not hidden.
+# Every entry needs a statement and an expiry date. When an entry expires the PR gate fails again,
+# so the finding must be fixed or explicitly re-justified in a reviewed pull request.
+# Policy: docs/ci-cd/CI-ARCHITECTURE.md#security-policy
+
+vulnerabilities:
+  - id: CVE-2026-102554
+    paths:
+      - "backend/pom.xml"
+    statement: >-
+      Baseline 2026-11-03. Transitive com.google.guava:guava 33.6.0-jre (fixed in 33.7.2), pulled in
+      by a cloud provider SDK. Tracked for an upgrade through Dependabot/the next dependency update;
+      the CI rollout deliberately makes no backend dependency changes.
+    expired_at: 2026-12-03

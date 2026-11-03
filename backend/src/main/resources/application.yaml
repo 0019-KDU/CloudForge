@@ -1,0 +1,119 @@
+# Base configuration. It is safe for any environment: no credentials, no defaults that point at a
+# real database, and nothing that changes the schema outside Flyway. Environment-specific values
+# come from environment variables or a profile file (see application-local.yaml).
+spring:
+  application:
+    name: cloudforge-backend
+
+  datasource:
+    url: ${CLOUDFORGE_DB_URL}
+    username: ${CLOUDFORGE_DB_USERNAME}
+    password: ${CLOUDFORGE_DB_PASSWORD}
+    hikari:
+      pool-name: cloudforge-db
+      maximum-pool-size: ${CLOUDFORGE_DB_POOL_SIZE:10}
+      connection-timeout: 5000      # ms: fail fast instead of queueing HTTP threads forever
+      max-lifetime: 1800000         # ms
+      data-source-properties:
+        ApplicationName: cloudforge-backend
+
+  jpa:
+    open-in-view: false             # no lazy loading during view rendering; services own transactions
+    hibernate:
+      ddl-auto: validate            # Flyway owns the schema; Hibernate only checks that it matches
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+        # Lazy collections (for example user roles) of a whole page load in one extra query, not one per row.
+        default_batch_fetch_size: 100
+
+  data:
+    web:
+      pageable:
+        default-page-size: 20
+        max-page-size: 100
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # clean is disabled by default in Flyway; never enable it outside throwaway test databases.
+
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+server:
+  shutdown: graceful
+  error:
+    include-message: never
+    include-stacktrace: never
+    include-binding-errors: never
+
+springdoc:
+  api-docs:
+    enabled: false        # enabled in the local profile; see OpenApiConfig
+  swagger-ui:
+    enabled: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+logging:
+  pattern:
+    # Plain-text logs carry the correlation ID. Deployed environments should switch to JSON with
+    # LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs (or logstash); the MDC is included automatically.
+    level: "%5p [%X{correlationId:-}]"
+
+cloudforge:
+  security:
+    jwt:
+      # Required. Base64 HMAC key of at least 256 bits: openssl rand -base64 32. Startup fails without it.
+      secret: ${CLOUDFORGE_JWT_SECRET:}
+      access-token-ttl: PT10M
+      refresh-token-ttl: P7D
+    login-throttle:
+      # Per client address, across all instances. Behind a reverse proxy also set
+      # server.forward-headers-strategy so the real client address is used.
+      max-attempts: 20
+      window: PT5M
+  bootstrap:
+    admin:
+      # Creates the first PLATFORM_ADMIN when set and no active admin exists. Remove after first start.
+      email: ${CLOUDFORGE_BOOTSTRAP_ADMIN_EMAIL:}
+      password: ${CLOUDFORGE_BOOTSTRAP_ADMIN_PASSWORD:}
+      display-name: ${CLOUDFORGE_BOOTSTRAP_ADMIN_DISPLAY_NAME:}
+  maintenance:
+    cron: "0 30 3 * * *"          # daily data-retention cleanup; "-" disables it
+    refresh-token-retention: P30D  # expired refresh tokens kept for incident analysis
+    notification-retention: P90D  # read notifications; unread ones are never removed
+  provisioning:
+    # Safe defaults: the worker is off and every provider is disabled. Real provisioning requires
+    # cloudforge.provisioning.<aws|gcp|kubernetes>.mode=real AND credentials from the platform
+    # (IAM role, Workload Identity, service account). See docs/architecture/provisioning-design.md.
+    worker:
+      enabled: ${CLOUDFORGE_PROVISIONING_WORKER_ENABLED:false}
+      poll-interval: PT10S
+      batch-size: 10
+      lease: PT5M
+    retry:
+      max-attempts: 5
+      base-delay: PT30S
+      max-delay: PT15M
+    operation-timeout: PT2H
+    aws:
+      mode: ${CLOUDFORGE_PROVISIONING_AWS_MODE:disabled}
+    gcp:
+      mode: ${CLOUDFORGE_PROVISIONING_GCP_MODE:disabled}
+    kubernetes:
+      mode: ${CLOUDFORGE_PROVISIONING_KUBERNETES_MODE:disabled}

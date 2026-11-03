@@ -1,0 +1,16 @@
+# Gitleaks configuration: the default rule set plus two narrow, reviewed exceptions.
+# Every exception names the exact file (and, where possible, the exact value) and why it is safe.
+# Add new exceptions only through a reviewed pull request; prefer removing the secret instead.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test-only JWT signing key. It exists only on the test classpath, signs tokens in tests and is documented in the file as never to be reused."
+condition = "AND"
+paths = ['''(^|/)backend/src/test/resources/config/application\.yaml$''']
+regexes = ['''^RGoOPzViO8BrjQn9tBsqmFvIKtuB4jCu7/XDTbmgvV0=$''']
+
+[[allowlists]]
+description = "Deliberately weak sample passwords (e.g. Qwerty123456) that PasswordPolicyTest asserts are rejected."
+paths = ['''(^|/)backend/src/test/java/com/cloudforge/identity/application/PasswordPolicyTest\.java$''']

@@ -1,0 +1,80 @@
+# Rendered at container start by the image's envsubst entrypoint into /tmp/nginx/default.conf.
+# Only CLOUDFORGE_* and NGINX_LOCAL_RESOLVERS are substituted (NGINX_ENVSUBST_FILTER).
+#
+# CLOUDFORGE_BACKEND_URL  where /api is forwarded: scheme://host:port, no path.
+#   Docker network:  http://cloudforge-backend:8080
+#   Kubernetes:      http://cloudforge-backend.<namespace>.svc.cluster.local:8080  (fully qualified:
+#                    NGINX's resolver does not apply resolv.conf search domains)
+#   An IP address works everywhere.
+#
+# NGINX_LOCAL_RESOLVERS  the container's nameservers from /etc/resolv.conf, set by the image's
+#                        entrypoint (NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1).
+
+server {
+    listen 8080;
+    listen [::]:8080;
+    server_name _;
+
+    root /usr/share/nginx/html;
+
+    # The backend is resolved per request (cached 10 s), not at start-up: the frontend starts even
+    # when the backend isn't up or resolvable yet, and follows backend IP changes.
+    resolver ${NGINX_LOCAL_RESOLVERS} valid=10s;
+    resolver_timeout 5s;
+
+    # Liveness/readiness for the orchestrator; not logged.
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # Same-origin API: the SPA calls /api and the backend has no CORS. The refresh cookie is scoped
+    # to /api/auth, so it only works when the API is served from this origin.
+    location /api/ {
+        # A variable makes NGINX resolve at request time; without a URI part the original request
+        # path (/api/...) is passed through unchanged.
+        set $cloudforge_backend "${CLOUDFORGE_BACKEND_URL}";
+        proxy_pass $cloudforge_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 60s;
+        client_max_body_size 1m;
+        # API responses carry their own Cache-Control (token responses are no-store).
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    # Hashed build output (assets/index-AbC123.js): safe to cache forever. ^~ so the extension regex
+    # below never takes these over.
+    location ^~ /assets/ {
+        try_files $uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    # The entry document must always be revalidated so users get new deployments immediately.
+    location = /index.html {
+        add_header Cache-Control "no-cache" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    # Unhashed public files (favicon, theme-init.js): short cache.
+    location ~* \.(?:svg|ico|js|css|woff2|png|webp)$ {
+        try_files $uri =404;
+        add_header Cache-Control "public, max-age=3600" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    # Client-side routes (/requests/123, /admin/users …) fall back to the SPA.
+    location / {
+        try_files $uri /index.html;
+        add_header Cache-Control "no-cache" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+}

@@ -1,0 +1,389 @@
+# CloudForge CI: validates every pull request to main and re-validates + builds every push to main.
+# Architecture, policies and local equivalents: docs/ci-cd/CI-ARCHITECTURE.md
+#
+# Branch protection requires ONE check: "ci-required". It always runs (even when jobs are skipped)
+# and fails unless every required job either succeeded or was legitimately skipped.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Every job declares exactly what it needs; nothing is granted by default.
+permissions: {}
+
+concurrency:
+  # One run per PR (or per ref for pushes). New PR commits cancel the obsolete run; pushes to main
+  # are never cancelled, so every merged commit gets its own validated build.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Scanner images: official images pinned by digest (immutable). The tag is for humans only.
+  # Update tag and digest together; see docs/ci-cd/CI-ARCHITECTURE.md#updating-pinned-versions.
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+  ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+  ZIZMOR_IMAGE: ghcr.io/zizmorcore/zizmor:1.32.0@sha256:3014cc8f68f663935f69b3c3e0e41f5ce102b268d97db13db0f62208747f860d
+
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  # Decide which parts of the monorepo changed. Path skipping happens here, at job level, so the
+  # workflow (and ci-required) always runs and a required check can never stay "pending".
+  # ---------------------------------------------------------------------------------------------
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Pushes to main and manual runs always validate everything.
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "Full validation for $EVENT_NAME."
+            { echo "backend=true"; echo "frontend=true"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          echo "Changed files:"
+          while IFS= read -r file; do echo "  $file"; done <<<"$changed"
+          # CI definitions affect every job, so a workflow change re-runs both stacks.
+          shared='^(\.github/workflows/|\.github/actions/)'
+          backend=false; frontend=false
+          if grep -qE "^backend/|$shared" <<<"$changed"; then backend=true; fi
+          if grep -qE "^frontend/|$shared" <<<"$changed"; then frontend=true; fi
+          echo "backend=$backend frontend=$frontend"
+          { echo "backend=$backend"; echo "frontend=$frontend"; } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------------------------
+  # Backend: Maven wrapper, Java 21. `verify` = validate, compile, unit tests (surefire, *Test),
+  # package (Spring Boot jar), integration tests (failsafe, *IT) against a throwaway PostgreSQL
+  # started by Testcontainers. No external database is ever used.
+  # ---------------------------------------------------------------------------------------------
+  backend:
+    name: Backend (build + unit + integration tests)
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: backend/pom.xml
+
+      - name: Build and test (./mvnw verify)
+        run: ./mvnw --batch-mode --no-transfer-progress verify
+
+      - name: Upload test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: backend-test-reports-${{ github.sha }}
+          path: |
+            backend/target/surefire-reports/
+            backend/target/failsafe-reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Record build metadata
+        if: github.event_name == 'push'
+        env:
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          jq -n --arg sha "$SHA" --arg ref "$REF" --arg run "$RUN_ID" \
+            --arg built "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg java "$(java -version 2>&1 | head -1)" \
+            '{component:"backend", commit:$sha, ref:$ref, run_id:$run, built_at:$built, java:$java}' \
+            > target/build-info.json
+          cat target/build-info.json
+
+      - name: Upload backend jar
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: backend-jar-${{ github.sha }}
+          path: |
+            backend/target/*.jar
+            backend/target/build-info.json
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------------------------
+  # Frontend: npm with the committed lockfile (npm ci), then the repository's own scripts.
+  # ---------------------------------------------------------------------------------------------
+  frontend:
+    name: Frontend (typecheck + lint + tests + build)
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies (npm ci)
+        run: npm ci --no-audit --no-fund
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm run test:run -- --reporter=default --reporter=junit --outputFile.junit=reports/junit.xml
+
+      - name: Production build
+        run: npm run build
+
+      - name: Upload test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: frontend-test-report-${{ github.sha }}
+          path: frontend/reports/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Record build metadata
+        if: github.event_name == 'push'
+        env:
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          jq -n --arg sha "$SHA" --arg ref "$REF" --arg run "$RUN_ID" \
+            --arg built "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg node "$(node --version)" \
+            '{component:"frontend", commit:$sha, ref:$ref, run_id:$run, built_at:$built, node:$node}' \
+            > dist/build-info.json
+          cat dist/build-info.json
+
+      - name: Upload production bundle
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: frontend-dist-${{ github.sha }}
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------------------------
+  # Secrets: Gitleaks on the commits this PR (or push) adds. Any finding blocks.
+  # Reviewed exceptions live in .gitleaks.toml. Full history is scanned weekly.
+  # ---------------------------------------------------------------------------------------------
+  secrets:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan new commits
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [[ "$EVENT_NAME" == "push" && -n "$PUSH_BEFORE" && ! "$PUSH_BEFORE" =~ ^0+$ ]]; then
+            range="$PUSH_BEFORE..$PUSH_AFTER"
+          else
+            range="$PUSH_AFTER"   # manual run or first push: everything reachable from this commit
+          fi
+          expected=$(git rev-list --count "$range")
+          echo "Scanning commit range $range ($expected commits)"
+          # git in the container must trust the mounted checkout (different owner), otherwise it
+          # refuses the repository and gitleaks reports success after scanning nothing. The
+          # exception is scoped to /repo and passed through git's environment-based config.
+          set +e
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo \
+            "$GITLEAKS_IMAGE" git /repo --config /repo/.gitleaks.toml --log-opts="$range" \
+            --redact --no-banner --no-color --verbose 2>&1 | tee "$RUNNER_TEMP/gitleaks.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error title=Secret detected::Gitleaks found a secret. Remove it, rotate it, and see docs/ci-cd/CI-ARCHITECTURE.md#12-investigating-failures"
+            exit "$status"
+          fi
+          # Guard against a silent pass: commits to scan but nothing scanned means the scan broke.
+          scanned=$(grep -oE '[0-9]+ commits scanned' "$RUNNER_TEMP/gitleaks.log" | grep -oE '^[0-9]+' || echo 0)
+          if (( expected > 0 && scanned == 0 )); then
+            echo "::error title=Secret scan did not run::Gitleaks scanned 0 of $expected commits"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------------------------
+  # Dependency review: blocks a PR that ADDS a dependency with a known HIGH/CRITICAL vulnerability.
+  # Existing dependencies are covered by the Trivy job and the weekly scan.
+  # ---------------------------------------------------------------------------------------------
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          show-patched-versions: true
+
+  # ---------------------------------------------------------------------------------------------
+  # Trivy: known vulnerabilities in pom.xml / package-lock.json and Dockerfile misconfigurations.
+  # Blocks on fixable HIGH/CRITICAL findings that are not in the reviewed, expiring baseline
+  # (.trivyignore.yaml). Lower severities are reported by the weekly scan instead.
+  #
+  # Maven dependencies are resolved by Maven into the cached local repository first, and Trivy
+  # reads them from there (--offline-scan). Letting Trivy fetch every transitive POM from Maven
+  # Central itself fails with HTTP 429 from shared runner IPs.
+  # ---------------------------------------------------------------------------------------------
+  trivy:
+    name: Vulnerability & config scan (Trivy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: backend/pom.xml
+
+      - name: Resolve Maven dependencies
+        working-directory: backend
+        run: ./mvnw --batch-mode --no-transfer-progress dependency:resolve
+
+      - name: Scan repository
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" -v "$HOME/.m2/repository:/root/.m2/repository:ro" \
+            -w /repo "$TRIVY_IMAGE" \
+            fs --scanners vuln,misconfig --severity HIGH,CRITICAL --ignore-unfixed --offline-scan \
+            --ignorefile .trivyignore.yaml --exit-code 1 --no-progress --format table .
+
+  # ---------------------------------------------------------------------------------------------
+  # Workflow validation: actionlint (syntax, expressions, shellcheck) and zizmor (security).
+  # zizmor runs offline here so no token reaches the container; online audits run weekly.
+  # ---------------------------------------------------------------------------------------------
+  workflows:
+    name: Workflow lint (actionlint + zizmor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        run: docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo "$ACTIONLINT_IMAGE" -color
+
+      - name: zizmor
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo "$ZIZMOR_IMAGE" \
+            --offline --format=github .github/workflows
+
+  # ---------------------------------------------------------------------------------------------
+  # The single required status check. Runs even when other jobs fail or are skipped.
+  # ---------------------------------------------------------------------------------------------
+  ci-required:
+    name: ci-required
+    if: ${{ always() }}
+    needs: [changes, backend, frontend, secrets, dependency-review, trivy, workflows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Evaluate required jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          BACKEND_EXPECTED: ${{ needs.changes.outputs.backend }}
+          FRONTEND_EXPECTED: ${{ needs.changes.outputs.frontend }}
+        run: |
+          # A job may be "skipped" only when skipping it was the intended outcome. Anything else that
+          # is not "success" (failure, cancelled, or an unexpected skip) fails this check.
+          allowed_skip() {
+            case "$1" in
+              backend)           [[ "$BACKEND_EXPECTED" != "true" ]] ;;
+              frontend)          [[ "$FRONTEND_EXPECTED" != "true" ]] ;;
+              dependency-review) [[ "$EVENT_NAME" != "pull_request" ]] ;;
+              *)                 return 1 ;;
+            esac
+          }
+          failed=0
+          while IFS=$'\t' read -r job result; do
+            if [[ "$result" == "success" ]]; then
+              echo "✅ $job: success"
+            elif [[ "$result" == "skipped" ]] && allowed_skip "$job"; then
+              echo "⏭️ $job: skipped (not affected by this change)"
+            else
+              echo "::error title=Required job $job::$job finished with '$result'"
+              failed=1
+            fi
+          done < <(jq -r 'to_entries[] | "\(.key)\t\(.value.result)"' <<<"$NEEDS")
+          if [[ "$failed" -ne 0 ]]; then
+            echo "One or more required jobs did not pass. Open the failing job above for details."
+            exit 1
+          fi
+          echo "All required jobs passed."
