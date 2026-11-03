@@ -175,7 +175,11 @@ jobs:
         run: npm run lint
 
       - name: Unit tests
-        run: npm run test:run -- --reporter=default --reporter=junit --outputFile.junit=reports/junit.xml
+        # github-actions reporter: failing tests become annotations on the PR/commit, readable
+        # without opening the job log.
+        run: >-
+          npm run test:run -- --reporter=default --reporter=github-actions
+          --reporter=junit --outputFile.junit=reports/junit.xml
 
       - name: Production build
         run: npm run build

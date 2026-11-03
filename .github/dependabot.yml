@@ -26,6 +26,10 @@ updates:
     cooldown:
       default-days: 5
     open-pull-requests-limit: 5
+    # Major upgrades are planned migrations (code changes, review), not automatic PRs.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       backend-minor-and-patch:
         update-types: [minor, patch]
@@ -40,6 +44,11 @@ updates:
     cooldown:
       default-days: 5
     open-pull-requests-limit: 5
+    # Major upgrades are planned migrations (code changes, review), not automatic PRs.
+    # @types/node must follow the Node version the project runs (22), not the latest Node.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       frontend-minor-and-patch:
         update-types: [minor, patch]
