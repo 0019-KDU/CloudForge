@@ -44,6 +44,8 @@ jobs:
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       frontend: ${{ steps.filter.outputs.frontend }}
+      # JSON list of the container images to build, e.g. ["backend","frontend"] or [].
+      images: ${{ steps.filter.outputs.images }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,19 +62,20 @@ jobs:
           # Pushes to main and manual runs always validate everything.
           if [[ "$EVENT_NAME" != "pull_request" ]]; then
             echo "Full validation for $EVENT_NAME."
-            { echo "backend=true"; echo "frontend=true"; } >> "$GITHUB_OUTPUT"
+            { echo "backend=true"; echo "frontend=true"; echo 'images=["backend","frontend"]'; } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
           echo "Changed files:"
           while IFS= read -r file; do echo "  $file"; done <<<"$changed"
           # CI definitions affect every job, so a workflow change re-runs both stacks.
-          shared='^(\.github/workflows/|\.github/actions/)'
+          shared='^(\.github/workflows/|\.github/actions/|\.github/scripts/)'
           backend=false; frontend=false
           if grep -qE "^backend/|$shared" <<<"$changed"; then backend=true; fi
           if grep -qE "^frontend/|$shared" <<<"$changed"; then frontend=true; fi
-          echo "backend=$backend frontend=$frontend"
-          { echo "backend=$backend"; echo "frontend=$frontend"; } >> "$GITHUB_OUTPUT"
+          images=$(jq -cn --argjson b "$backend" --argjson f "$frontend"             '[if $b then "backend" else empty end, if $f then "frontend" else empty end]')
+          echo "backend=$backend frontend=$frontend images=$images"
+          { echo "backend=$backend"; echo "frontend=$frontend"; echo "images=$images"; } >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------------------------
   # Backend: Maven wrapper, Java 21. `verify` = validate, compile, unit tests (surefire, *Test),
@@ -216,6 +219,94 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------------------------
+  # Container images: build each changed component's production image (Dockerfile in backend/ or
+  # frontend/), scan the built image, and start it in a smoke test. Nothing is pushed: images stay
+  # on the runner (and, for pushes to main, become a downloadable artifact).
+  #
+  #   build  - BuildKit with a GitHub Actions layer cache; OCI labels carry the commit
+  #   scan   - Trivy on the image itself: OS packages and bundled libraries (what the repository
+  #            scan can't see) plus secrets baked into layers. Same gate as the trivy job.
+  #   SBOM   - CycloneDX inventory of everything in the image, kept as an artifact
+  #   smoke  - .github/scripts/smoke-test-<component>-image.sh: read-only, no capabilities, non-root
+  # ---------------------------------------------------------------------------------------------
+  images:
+    name: Image (${{ matrix.component }})
+    needs: changes
+    if: needs.changes.outputs.images != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.changes.outputs.images) }}
+    env:
+      IMAGE: cloudforge-${{ matrix.component }}:ci-${{ github.sha }}
+      # The step summary is enough; don't add a build-record artifact to every run.
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.component }}
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            REVISION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          # Attestations belong to publishing (future CD); a loaded local image can't carry them.
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=image-${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.component }}
+
+      - name: Export image
+        run: |
+          docker save -o "$RUNNER_TEMP/image.tar" "$IMAGE"
+          docker image inspect "$IMAGE" --format 'Image {{.Id}}, {{.Size}} bytes, user {{.Config.User}}'
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          docker run --rm -v "$RUNNER_TEMP:/work" "$TRIVY_IMAGE"             image --input /work/image.tar --format cyclonedx --output /work/sbom.cdx.json --no-progress
+
+      - name: Scan image (Trivy)
+        run: |
+          docker run --rm -v "$RUNNER_TEMP:/work:ro" -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo "$TRIVY_IMAGE"             image --input /work/image.tar --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed             --ignorefile .trivyignore.yaml --exit-code 1 --no-progress --format table
+
+      - name: Smoke test
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: .github/scripts/smoke-test-"$COMPONENT"-image.sh "$IMAGE"
+
+      - name: Upload SBOM
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.component }}-image-sbom-${{ github.sha }}
+          path: ${{ runner.temp }}/sbom.cdx.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload image
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.component }}-image-${{ github.sha }}
+          path: ${{ runner.temp }}/image.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------------------------
   # Secrets: Gitleaks on the commits this PR (or push) adds. Any finding blocks.
   # Reviewed exceptions live in .gitleaks.toml. Full history is scanned weekly.
   # ---------------------------------------------------------------------------------------------
@@ -342,6 +433,11 @@ jobs:
       - name: actionlint
         run: docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo "$ACTIONLINT_IMAGE" -color
 
+      # actionlint checks the run: blocks; the standalone CI scripts get the same ShellCheck pass.
+      - name: shellcheck (.github/scripts)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo --entrypoint shellcheck "$ACTIONLINT_IMAGE"             .github/scripts/*.sh
+
       - name: zizmor
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" -w /repo "$ZIZMOR_IMAGE" \
@@ -353,7 +449,7 @@ jobs:
   ci-required:
     name: ci-required
     if: ${{ always() }}
-    needs: [changes, backend, frontend, secrets, dependency-review, trivy, workflows]
+    needs: [changes, backend, frontend, images, secrets, dependency-review, trivy, workflows]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -364,6 +460,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BACKEND_EXPECTED: ${{ needs.changes.outputs.backend }}
           FRONTEND_EXPECTED: ${{ needs.changes.outputs.frontend }}
+          IMAGES_EXPECTED: ${{ needs.changes.outputs.images }}
         run: |
           # A job may be "skipped" only when skipping it was the intended outcome. Anything else that
           # is not "success" (failure, cancelled, or an unexpected skip) fails this check.
@@ -371,6 +468,7 @@ jobs:
             case "$1" in
               backend)           [[ "$BACKEND_EXPECTED" != "true" ]] ;;
               frontend)          [[ "$FRONTEND_EXPECTED" != "true" ]] ;;
+              images)            [[ "$IMAGES_EXPECTED" == "[]" ]] ;;
               dependency-review) [[ "$EVENT_NAME" != "pull_request" ]] ;;
               *)                 return 1 ;;
             esac

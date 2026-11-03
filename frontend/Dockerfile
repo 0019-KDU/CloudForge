@@ -7,13 +7,11 @@
 #   docker run -p 8080:8080 -e CLOUDFORGE_BACKEND_URL=http://cloudforge-backend:8080 cloudforge-frontend:<version>
 #
 # Stages: deps (npm ci, cached) → build (typecheck + Vite) → test (optional) → runtime (NGINX, static files only).
-# Base images are pinned by version AND digest for reproducible builds; update both together.
-
-ARG NODE_IMAGE=node:22.23.4-alpine3.24@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
-ARG NGINX_IMAGE=nginxinc/nginx-unprivileged:1.31.7-alpine3.24@sha256:b5047b9b76845eac124358373c6852377c52e4b05834a47647e955dd91cb8f1e
+# Base images are pinned by version AND digest for reproducible builds. They are written out in each
+# FROM line, not through ARGs, so Dependabot can update the tag and digest together.
 
 # ---- dependencies --------------------------------------------------------------------------------
-FROM ${NODE_IMAGE} AS deps
+FROM node:22.23.4-alpine3.24@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 AS deps
 WORKDIR /app
 ENV CI=true
 # Manifests first: this layer is reused until package.json or the lockfile changes.
@@ -37,7 +35,7 @@ FROM build AS test
 RUN npm run lint && npm run test:run
 
 # ---- runtime -------------------------------------------------------------------------------------
-FROM ${NGINX_IMAGE} AS runtime
+FROM nginxinc/nginx-unprivileged:1.31.7-alpine3.24@sha256:b5047b9b76845eac124358373c6852377c52e4b05834a47647e955dd91cb8f1e AS runtime
 
 ARG VERSION=dev
 ARG REVISION=unknown
@@ -45,6 +43,12 @@ LABEL org.opencontainers.image.title="cloudforge-frontend" \
       org.opencontainers.image.description="CloudForge web console (React SPA served by NGINX)" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
+
+# Base images are rebuilt only every few weeks; apply OS security fixes released since then. The
+# CI image scan (Trivy) fails the build on fixable HIGH/CRITICAL packages, so this keeps it green
+# between base-image updates.
+USER root
+RUN apk upgrade --no-cache
 
 # Config and site files belong to root and are read-only for the nginx user (uid 101) that runs
 # the server: a compromised worker can't rewrite the app it serves.

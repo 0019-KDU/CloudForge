@@ -7,6 +7,8 @@ vulnerabilities:
   - id: CVE-2026-102554
     paths:
       - "backend/pom.xml"
+      # The same jar inside the backend image (CI images job).
+      - "app/lib/guava-*.jar"
     statement: >-
       Baseline 2026-11-03. Transitive com.google.guava:guava 33.6.0-jre (fixed in 33.7.2), pulled in
       by a cloud provider SDK. Tracked for an upgrade through Dependabot/the next dependency update;
