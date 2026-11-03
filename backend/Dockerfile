@@ -16,14 +16,14 @@
 #   1. build   - JDK + Maven wrapper compile the jar, then Spring Boot's jarmode splits it into layers
 #   2. jre     - jlink builds a trimmed Java runtime with exactly the modules the app needs
 #   3. runtime - Ubuntu + that runtime + the layered app; non-root, healthcheck, no build tools
-
-ARG JAVA_VERSION=21
-ARG UBUNTU_VERSION=24.04
+#
+# Base images are pinned by exact version AND digest (reproducible builds). They are written out in
+# each FROM line, not through ARGs, so Dependabot can update the tag and digest together.
 
 # ---------------------------------------------------------------------------------------------------
 # Stage 1: build the jar and extract its layers
 # ---------------------------------------------------------------------------------------------------
-FROM eclipse-temurin:${JAVA_VERSION}-jdk-noble AS build
+FROM eclipse-temurin:21.0.13_9-jdk-noble@sha256:114cabb73033ca4ce7ceec3deb62396bc1b716282bae051ed3c1d82e38fcab2d AS build
 WORKDIR /workspace
 
 # Wrapper and pom first: this layer and the dependency download only rerun when they change.
@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/root/.m2 \
 # The stock Temurin JRE image leaves out jdk.random, which RandomGenerator.getDefault() (used by the
 # provisioning RetryPolicy) needs. This runtime is the stock JRE module set plus jdk.random, minus the
 # remote debugger agent. It does not depend on the build stage, so code changes never rerun it.
-FROM eclipse-temurin:${JAVA_VERSION}-jdk-noble AS jre
+FROM eclipse-temurin:21.0.13_9-jdk-noble@sha256:114cabb73033ca4ce7ceec3deb62396bc1b716282bae051ed3c1d82e38fcab2d AS jre
 RUN jlink \
       --add-modules java.se,jdk.random,jdk.unsupported,jdk.crypto.ec,jdk.crypto.cryptoki,jdk.charsets,jdk.localedata,jdk.zipfs,jdk.naming.dns,jdk.net,jdk.security.auth,jdk.security.jgss,jdk.management,jdk.management.agent,jdk.management.jfr,jdk.jfr,jdk.httpserver,jdk.nio.mapmode \
       --strip-debug \
@@ -59,12 +59,16 @@ RUN jlink \
 # ---------------------------------------------------------------------------------------------------
 # Stage 3: runtime
 # ---------------------------------------------------------------------------------------------------
-FROM ubuntu:${UBUNTU_VERSION} AS runtime
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS runtime
 
+ARG VERSION=dev
+ARG REVISION=unknown
 LABEL org.opencontainers.image.title="cloudforge-backend" \
       org.opencontainers.image.description="Cloud resource provisioning and governance platform - backend API" \
       org.opencontainers.image.vendor="CloudForge" \
-      org.opencontainers.image.licenses="Proprietary"
+      org.opencontainers.image.licenses="Proprietary" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}"
 
 # Patch the OS, add only what the runtime needs (TLS roots, time zones, curl for the healthcheck),
 # then a fixed, unprivileged user with no login shell and no home directory.

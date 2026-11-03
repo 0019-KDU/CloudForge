@@ -1,6 +1,7 @@
 # CloudForge CI architecture
 
-> Scope: continuous **integration** only. Nothing in CI deploys, publishes images, or holds cloud
+> Scope: continuous **integration** only. CI builds and tests the production images but never pushes
+> them to a registry. Nothing in CI deploys or holds cloud
 > credentials, and CI can never trigger real provisioning (the backend's providers are `disabled`
 > by default and the tests use scripted fakes; see ADR-0008).
 
@@ -10,7 +11,7 @@ Three GitHub Actions workflows:
 
 | Workflow | Triggers | Purpose | Blocks merges? |
 |---|---|---|---|
-| [`ci.yml`](../../.github/workflows/ci.yml) | PR to `main`, push to `main`, manual | Build, test, secret scan, dependency and config scan, workflow lint; on `main` also store build artifacts | **Yes**, through `ci-required` |
+| [`ci.yml`](../../.github/workflows/ci.yml) | PR to `main`, push to `main`, manual | Build, test, production images (build + scan + smoke test), secret scan, dependency and config scan, workflow lint; on `main` also store build artifacts | **Yes**, through `ci-required` |
 | [`codeql.yml`](../../.github/workflows/codeql.yml) | PR to `main`, push to `main`, weekly, manual | CodeQL SAST for Java and TypeScript, results in Code scanning | Not yet (advisory, see [CodeQL](#codeql)) |
 | [`security-scheduled.yml`](../../.github/workflows/security-scheduled.yml) | Weekly, manual | Full-history secret scan, full vulnerability scan to Code scanning, online workflow audits | No (alerts and notifications) |
 
@@ -30,10 +31,12 @@ flowchart TD
 
     C -->|backend/** or workflows changed| B[backend<br/>./mvnw verify]
     C -->|frontend/** or workflows changed| F[frontend<br/>npm ci, typecheck, lint, test, build]
+    C -->|per changed stack| I[images<br/>docker build, Trivy image scan,<br/>SBOM, smoke test]
 
     C --> R[ci-required]
     B --> R
     F --> R
+    I --> R
     S --> R
     D --> R
     T --> R
@@ -44,8 +47,8 @@ flowchart TD
     G -->|No| X[Fix the failing job]
 ```
 
-All jobs except `backend` and `frontend` start immediately and run in parallel; those two wait only
-for the few-second `changes` job. `ci-required` waits for everything.
+All jobs except `backend`, `frontend` and `images` start immediately and run in parallel; those wait
+only for the few-second `changes` job. `ci-required` waits for everything.
 
 ## 2. Workflow responsibilities
 
@@ -53,13 +56,14 @@ for the few-second `changes` job. `ci-required` waits for everything.
 
 | Job | What it does | Runs when |
 |---|---|---|
-| `changes` | `git diff base...head` to decide whether backend and/or frontend changed | always |
+| `changes` | `git diff base...head` to decide whether backend and/or frontend changed, and which images to build | always |
 | `backend` | Java 21 (Temurin) + Maven wrapper: `./mvnw verify` | backend or workflow files changed; every push to `main` |
 | `frontend` | Node from `.nvmrc`: `npm ci`, `typecheck`, `lint`, `test:run`, `build` | frontend or workflow files changed; every push to `main` |
+| `images` (matrix: `backend`, `frontend`) | Builds the component's production image from its `Dockerfile`, scans the built image with Trivy, generates a CycloneDX SBOM and runs the smoke test (section 4a) | same conditions as the component's job |
 | `secrets` | Gitleaks on the commits the PR/push adds | always |
 | `dependency-review` | Blocks PRs that **add** a dependency with a HIGH/CRITICAL advisory | pull requests |
 | `trivy` | Fixable HIGH/CRITICAL vulnerabilities in `pom.xml`/`package-lock.json`, Dockerfile misconfigurations | always |
-| `workflows` | actionlint (incl. ShellCheck) and zizmor (offline) over `.github/workflows` | always |
+| `workflows` | actionlint (incl. ShellCheck) and zizmor (offline) over `.github/workflows`; ShellCheck over `.github/scripts` | always |
 | `ci-required` | Aggregates all of the above into one status | always (`if: always()`) |
 
 ### Trigger conditions
@@ -106,6 +110,46 @@ Checked in the effective POM rather than assumed. The Spring Boot parent binds f
 Checkstyle). Adding one is a team decision (it reformats every file), so it's listed under
 [future improvements](#14-future-improvements) instead of being invented here.
 
+## 4a. Production images
+
+The `images` job builds exactly what would be deployed: `backend/Dockerfile` and `frontend/Dockerfile`,
+unchanged. It never pushes to a registry.
+
+| Step | What happens | Fails the build when |
+|---|---|---|
+| Build | `docker/build-push-action` (BuildKit), `load: true`, `push: false`. Tag `cloudforge-<component>:ci-<sha>`; OCI labels `version`, `revision` (commit) and `source`. Layer cache in the GitHub Actions cache, one scope per component | the Dockerfile doesn't build |
+| SBOM | Trivy writes a CycloneDX inventory of the image (OS packages, every jar or npm package inside) | never (it's a record) |
+| Scan | Trivy on the **built image**: OS packages of the base image and libraries bundled into it, plus secrets accidentally baked into a layer | a fixable HIGH/CRITICAL vulnerability or any secret, unless baselined in `.trivyignore.yaml` |
+| Smoke test | `.github/scripts/smoke-test-<component>-image.sh` starts the image locked down: `--read-only`, `--cap-drop ALL`, `no-new-privileges`, non-root | any check below fails |
+
+The image scan is separate from the `trivy` job on purpose: the repository scan sees `pom.xml`,
+`package-lock.json` and the Dockerfiles, but not what the base images contain. The frontend image
+first failed this scan on 5 fixable Alpine packages (curl, libcurl, brotli, libexpat) that the newest
+`nginx-unprivileged` release still ships, which is why both Dockerfiles apply OS security updates at
+build time (`apt-get upgrade` / `apk upgrade`).
+
+**Smoke test checks**
+
+| Backend (with a throwaway PostgreSQL 17 and random credentials) | Frontend (no backend) |
+|---|---|
+| Starts; Flyway migrates the empty database; `/actuator/health/readiness` is UP within 3 minutes | `/healthz` answers 200 |
+| Liveness is UP; runs as uid 10001 | Runs as uid 101 |
+| `/api/users/me` without a token → 401; `/v3/api-docs` is not served | `/` is the SPA; `/requests/123` falls back to it |
+| The bootstrap admin logs in and `/api/users/me` with the token → 200 | Security headers (CSP, nosniff, DENY); `index.html` is `no-cache`, `/assets/*` immutable |
+| No `ERROR` lines in the log | No source maps shipped; `/api` reaches the proxy (502 without a backend) |
+
+On failure the script prints the container log. Both scripts also run locally (section 11).
+
+**Base images are pinned by exact version and digest**, written out in each `FROM` line so Dependabot
+(`docker` ecosystem) can update tag and digest together:
+
+| Image | Used for |
+|---|---|
+| `eclipse-temurin:21.0.13_9-jdk-noble@sha256:114cabb7…` | backend build and `jlink` stages |
+| `ubuntu:24.04@sha256:fe815609…` | backend runtime |
+| `node:22.23.4-alpine3.24@sha256:fe4f6d74…` | frontend build |
+| `nginxinc/nginx-unprivileged:1.31.7-alpine3.24@sha256:b5047b9b…` | frontend runtime |
+
 ## 5. Security scanning
 
 ### Tools and why each one is here
@@ -114,7 +158,7 @@ Checkstyle). Adding one is a team decision (it reformats every file), so it's li
 |---|---|---|---|
 | **Gitleaks** | committed secrets | PR (new commits), weekly (full history) | Fast, offline, good default rules |
 | **Dependency Review** | vulnerable dependencies *added* by a PR | PR | GitHub-native, knows exactly what the PR changes |
-| **Trivy** | known CVEs in all dependencies (incl. transitive Maven), Dockerfile misconfigurations | PR (gate), weekly (full report) | Covers transitive Maven deps that GitHub's static `pom.xml` graph doesn't |
+| **Trivy** | known CVEs in all dependencies (incl. transitive Maven), Dockerfile misconfigurations; in the `images` job also the built images' OS packages and baked-in secrets | PR (gate), weekly (full report) | Covers transitive Maven deps that GitHub's static `pom.xml` graph doesn't |
 | **CodeQL** | code vulnerabilities (injection, auth flaws…) in Java and TypeScript | PR, main, weekly | GitHub-native SAST, free for public repos |
 | **actionlint** | broken workflow syntax/expressions, shell bugs (ShellCheck) | PR | Catches CI breakage before merge |
 | **zizmor** | insecure workflow patterns (injection, over-broad permissions, credential persistence, unpinned actions) | PR (offline), weekly (online audits) | Purpose-built for GitHub Actions security |
@@ -124,7 +168,8 @@ Two implementation details that matter, both found while testing the jobs locall
 - **Gitleaks can pass while scanning nothing.** The mounted checkout belongs to a different user than git inside the container, so git refuses it ("dubious ownership") and Gitleaks still exits 0. The jobs therefore pass a `safe.directory=/repo` exception through git's environment-based config, and a **guard fails the job if the range contains commits but Gitleaks reports scanning 0**.
 - **Trivy must not fetch Maven POMs itself.** Resolving `pom.xml` makes Trivy download every transitive POM from Maven Central, which answered `429 Too Many Requests`; shared runner IPs make that likely. The jobs first run `./mvnw dependency:resolve` into the cached local repository, mount it read-only into the container, and scan with `--offline-scan`.
 
-Trivy's secret scanner is **not** enabled, because Gitleaks already does that job. Trivy IaC scanning
+Trivy's secret scanner is **not** enabled on the repository, because Gitleaks already does that job;
+it is enabled on the built images, which Gitleaks can't see. Trivy IaC scanning
 covers only the two Dockerfiles; there is no Terraform, Kubernetes or Helm in the repository, so no
 IaC jobs exist.
 
@@ -135,6 +180,8 @@ IaC jobs exist.
 | Secret in a new commit (any Gitleaks rule) | **Blocks** (`secrets` job). Gitleaks does not verify secrets against providers, so every match is treated as real until proven otherwise. |
 | PR adds a dependency with a HIGH/CRITICAL advisory | **Blocks** (`dependency-review`, `fail-on-severity: high`) |
 | Fixable HIGH/CRITICAL vulnerability or Dockerfile misconfiguration anywhere in the repo | **Blocks** (`trivy`), unless baselined in `.trivyignore.yaml` |
+| Fixable HIGH/CRITICAL vulnerability or a secret in a built image | **Blocks** (`images`), unless baselined in `.trivyignore.yaml` |
+| Image doesn't start or a smoke check fails | **Blocks** (`images`) |
 | Unfixable HIGH/CRITICAL, all MEDIUM/LOW | Reported weekly to Code scanning; not blocking |
 | CodeQL alerts | Reported on the PR and in Code scanning; advisory for now |
 | Workflow misconfiguration (zizmor) or broken workflow (actionlint) | **Blocks** (`workflows`) |
@@ -172,7 +219,7 @@ No `continue-on-error` is used anywhere.
 
 ## 6. Action and image pinning
 
-**GitHub-maintained actions are pinned to full commit SHAs**, resolved from the GitHub API on
+**Actions are pinned to full commit SHAs** (GitHub's and Docker's own; no community actions), resolved from the GitHub API on
 2026-11-03, following annotated tags down to the commit:
 
 | Action | Version | Commit |
@@ -183,6 +230,8 @@ No `continue-on-error` is used anywhere.
 | `actions/upload-artifact` | v7.0.2 | `cf430e030ddbb5b0abf93d22962f4752f3646cd9` |
 | `actions/dependency-review-action` | v5.0.0 | `a1d282b36b6f3519aa1f3fc636f609c47dddb294` |
 | `github/codeql-action` (`init`, `analyze`, `upload-sarif`) | v4.39.1 | `9b3254085494b55a0f7c4c2b3d2d52cc712ce370` |
+| `docker/setup-buildx-action` (Docker's official action) | v4.4.1 | `f87e5991a6d7451dcb8d9637bfbc97413f497069` |
+| `docker/build-push-action` (Docker's official action; used build-only) | v7.4.0 | `c3c9e263c25d99ce0380d002d59b67737d91b0dc` |
 
 **Third-party scanners run as official container images pinned by digest**, not through third-party
 actions:
@@ -214,7 +263,7 @@ Decision rules (tested against 13 scenarios before merging, see section 11):
 | Job result | Outcome |
 |---|---|
 | `success` | ok |
-| `skipped`, and skipping was expected | ok. Allowed only for `backend` (no backend/workflow change), `frontend` (no frontend/workflow change) and `dependency-review` (not a PR). |
+| `skipped`, and skipping was expected | ok. Allowed only for `backend` (no backend/workflow change), `frontend` (no frontend/workflow change), `images` (neither changed) and `dependency-review` (not a PR). |
 | `skipped` unexpectedly, e.g. backend changed but its job was skipped | **fail** |
 | `failure` or `cancelled` | **fail** |
 | `changes` itself failed | **fail** (the stacks are then skipped, and that skip doesn't count as intended) |
@@ -230,10 +279,12 @@ On every push to `main` (the merged commit), all jobs run regardless of paths, a
 |---|---|---|
 | `backend-jar-<sha>` | Spring Boot jar + `build-info.json` | 30 days |
 | `frontend-dist-<sha>` | Production bundle + `build-info.json` | 30 days |
+| `backend-image-<sha>`, `frontend-image-<sha>` | The tested production image (`docker save` tar; `docker load -i image.tar`) | 7 days |
+| `backend-image-sbom-<sha>`, `frontend-image-sbom-<sha>` | CycloneDX SBOM of each image (also on PRs) | 30 days |
 | `backend-test-reports-<sha>`, `frontend-test-report-<sha>` | JUnit XML | 14 days |
 
 `build-info.json` records the component, commit SHA, ref, run ID, build time and toolchain version.
-Nothing is deployed and no image is pushed.
+Nothing is deployed and no image is pushed to a registry.
 
 ## 9. Branch protection recommendations
 
@@ -277,6 +328,16 @@ docker run --rm -v "$PWD:/repo:ro" -v "$HOME/.m2/repository:/root/.m2/repository
   --ignorefile .trivyignore.yaml --exit-code 1 .
 docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12
 docker run --rm -v "$PWD:/repo:ro" -w /repo ghcr.io/zizmorcore/zizmor:1.32.0 --offline .github/workflows
+
+# Production images: build, scan, smoke test (same scripts as CI)
+docker build -t cloudforge-backend:local backend
+docker build -t cloudforge-frontend:local frontend
+docker save -o /tmp/backend.tar cloudforge-backend:local
+docker run --rm -v /tmp:/work:ro -v "$PWD:/repo:ro" -w /repo ghcr.io/aquasecurity/trivy:0.76.1 \
+  image --input /work/backend.tar --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed \
+  --ignorefile .trivyignore.yaml --exit-code 1
+.github/scripts/smoke-test-backend-image.sh cloudforge-backend:local
+.github/scripts/smoke-test-frontend-image.sh cloudforge-frontend:local
 ```
 
 On Windows Git Bash, prefix the `docker run` commands with `MSYS_NO_PATHCONV=1`. Locally, `--skip-dirs`
@@ -306,6 +367,7 @@ git ls-files -s backend/mvnw      # must show 100755
 | `backend` fails at `./mvnw` with "Permission denied" | `git ls-files -s backend/mvnw` | committed without the executable bit; see "Committing from Windows" in section 11 |
 | `dependency-review` | job summary lists the package and advisory | use the patched version shown |
 | `trivy` | table of CVEs or Dockerfile findings | upgrade the dependency, or add a justified, expiring entry to `.trivyignore.yaml` |
+| `images` | the failing step: build (Dockerfile), scan (table of packages), smoke test (the ❌ check, with the container log printed below it); the SBOM artifact lists every package | build and run the image locally (section 11); for OS packages, a newer base image or the build-time upgrade; for a smoke check, the container log usually names the cause |
 | `workflows` | annotations on the workflow file | fix syntax (actionlint) or the security issue (zizmor explains each audit) |
 | CodeQL | Security → Code scanning, or the PR's annotations | fix, or dismiss with a reason (false positive / used in tests) |
 
@@ -338,4 +400,5 @@ job durations) before tuning.
 4. **Maven dependency submission**, so Dependency Review also sees transitive Maven dependencies.
 5. **Merge queue** (`merge_group` trigger) once several people merge concurrently.
 6. **OpenSSF Scorecard** for repository-level security posture.
-7. **Image builds in CI** (build-only, then scan with Trivy) when container delivery is designed. Registry publishing, signing and SBOMs belong to the future CD design.
+7. **Image publishing** belongs to the future CD design: push to a registry by digest, sign (cosign, keyless OIDC) and attach the SBOM and provenance as attestations. CI already builds, scans and smoke-tests the images.
+8. **Multi-arch images** (`linux/arm64`) if a deployment target needs them; CI builds `linux/amd64` only.
