@@ -70,7 +70,7 @@ describe("engineer: creating a request", () => {
 
   it("keeps the work as a draft and explains when submission is refused", async () => {
     const db = useFakeBackend({ ...users.engineer, managerId: null });
-    const { user } = renderApp("/requests/new?type=K8S_NAMESPACE");
+    const { user, router } = renderApp("/requests/new?type=K8S_NAMESPACE");
 
     await user.click(await screen.findByRole("radio", { name: "Development" }));
     await user.type(screen.getByLabelText("Namespace"), "orphan-ns");
@@ -84,7 +84,12 @@ describe("engineer: creating a request", () => {
     expect(await screen.findByText(/was saved as a draft but not submitted/)).toBeInTheDocument();
     expect(screen.getByText(/You have no manager to approve this request/)).toBeInTheDocument();
     expect(db.requests[0]?.status).toBe("DRAFT");
-    expect(await screen.findByRole("button", { name: "Submit for approval" })).toBeInTheDocument();
+    // The form also has a "Submit for approval" button, so wait until the draft's detail page is
+    // really shown (its URL and its Edit link) before looking for the detail page's own button.
+    // Checking earlier races the navigation and can grab the form's button just before it unmounts.
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/requests/${db.requests[0]?.id ?? ""}`));
+    expect(await screen.findByRole("link", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Submit for approval" })).toBeInTheDocument();
   });
 
   it("offers only resource types that some environment allows", async () => {
