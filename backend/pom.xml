@@ -20,7 +20,7 @@
 		<!-- Cloud provider SDKs (not managed by Spring Boot); see docs/architecture/provisioning-design.md. -->
 		<aws-sdk.version>2.56.0</aws-sdk.version>
 		<google-cloud-resourcemanager.version>1.101.0</google-cloud-resourcemanager.version>
-		<kubernetes-client.version>27.0.1</kubernetes-client.version>
+		<kubernetes-client.version>28.0.0</kubernetes-client.version>
 	</properties>
 
 	<dependencyManagement>
