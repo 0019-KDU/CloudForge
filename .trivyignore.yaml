@@ -14,3 +14,24 @@ vulnerabilities:
       by a cloud provider SDK. Tracked for an upgrade through Dependabot/the next dependency update;
       the CI rollout deliberately makes no backend dependency changes.
     expired_at: 2026-12-03
+
+misconfigurations:
+  - id: AWS-0054
+    paths:
+      - "infra/modules/app/alb.tf"
+    statement: >-
+      Accepted 2026-11-23. Plain HTTP only between CloudFront and the internal load balancer, which
+      has no public address and is reached through a CloudFront VPC origin inside AWS's network;
+      browsers always get HTTPS from CloudFront. An HTTPS listener needs an ACM certificate for a
+      domain the project doesn't have yet. Re-review when a domain is added.
+    expired_at: 2027-05-23
+  - id: AWS-0104
+    paths:
+      - "infra/modules/app/ecs.tf"
+      - "infra/modules/environment/main.tf"
+    statement: >-
+      Accepted 2026-11-23. Egress is limited to TCP 443. The tasks must reach ECR, Secrets Manager,
+      CloudWatch and (when provisioning is enabled) the AWS, GCP and Kubernetes APIs, whose addresses
+      are not fixed. The alternative, VPC interface endpoints, costs about $58/month per environment
+      and still can't cover the non-AWS APIs. Re-review if provisioning targets become fixed.
+    expired_at: 2027-05-23

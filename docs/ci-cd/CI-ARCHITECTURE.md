@@ -1,9 +1,11 @@
 # CloudForge CI architecture
 
-> Scope: continuous **integration** only. CI builds and tests the production images but never pushes
-> them to a registry. Nothing in CI deploys or holds cloud
-> credentials, and CI can never trigger real provisioning (the backend's providers are `disabled`
-> by default and the tests use scripted fakes; see ADR-0008).
+> Scope: continuous **integration**. The CI jobs build and test the production images and hold no
+> cloud credentials. CI can never trigger real provisioning: the backend's providers are `disabled`
+> by default, and the tests use scripted fakes (see ADR-0008). Delivery, meaning the
+> `deploy-staging` job after `ci-required` on `main` and the manual production promotion, is
+> described in [CD-ARCHITECTURE.md](CD-ARCHITECTURE.md). Only those deploy jobs get AWS access,
+> through OIDC.
 
 ## 1. Overview
 

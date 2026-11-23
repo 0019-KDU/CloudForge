@@ -1,0 +1,17 @@
+# Provider downloads and local state (the real state lives in S3)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Per-person settings: values may include e-mail addresses or account details
+*.tfvars
+!*.tfvars.example
+backend.hcl
+
+# Plans can contain sensitive values
+*.tfplan
+tfplan
+
+# .terraform.lock.hcl IS committed: it pins provider versions and checksums.

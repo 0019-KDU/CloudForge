@@ -488,3 +488,25 @@ jobs:
             exit 1
           fi
           echo "All required jobs passed."
+
+  # ---------------------------------------------------------------------------------------------
+  # Continuous delivery to staging: every push to main that passed every check is deployed with the
+  # exact images the images job built and tested in this run. Production is promoted manually
+  # (Actions → Deploy → Run workflow), behind the "production" environment's approval.
+  # Off until the AWS infrastructure exists: set the repository variable CD_STAGING_ENABLED=true.
+  # ---------------------------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to staging
+    needs: ci-required
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.CD_STAGING_ENABLED == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    # zizmor's self-repository audit prefers GitHub's newer "$/..." form (July 2026), but actionlint
+    # (1.7.12, the latest release) predates it and can't parse it. "./" is still fully supported.
+    # Switch to "$/.github/workflows/deploy.yml" once actionlint understands it.
+    uses: ./.github/workflows/deploy.yml # zizmor: ignore[self-repository]
+    with:
+      environment: staging
+      image_tag: ${{ github.sha }}
+      push_images: true
