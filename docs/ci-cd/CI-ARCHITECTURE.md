@@ -145,9 +145,9 @@ On failure the script prints the container log. Both scripts also run locally (s
 
 | Image | Used for |
 |---|---|
-| `eclipse-temurin:21.0.13_9-jdk-noble@sha256:114cabb7…` | backend build and `jlink` stages |
-| `ubuntu:24.04@sha256:fe815609…` | backend runtime |
-| `node:22.23.4-alpine3.24@sha256:fe4f6d74…` | frontend build |
+| `eclipse-temurin:21.0.13.1_2-jdk-noble@sha256:4dea56dc…` | backend build and `jlink` stages |
+| `ubuntu:24.04@sha256:9c7f200c…` | backend runtime |
+| `node:22.23.5-alpine3.24@sha256:1314fb30…` | frontend build |
 | `nginxinc/nginx-unprivileged:1.31.7-alpine3.24@sha256:b5047b9b…` | frontend runtime |
 
 ## 5. Security scanning

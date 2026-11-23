@@ -23,7 +23,7 @@
 # ---------------------------------------------------------------------------------------------------
 # Stage 1: build the jar and extract its layers
 # ---------------------------------------------------------------------------------------------------
-FROM eclipse-temurin:21.0.13_9-jdk-noble@sha256:114cabb73033ca4ce7ceec3deb62396bc1b716282bae051ed3c1d82e38fcab2d AS build
+FROM eclipse-temurin:21.0.13.1_2-jdk-noble@sha256:4dea56dcfa1a89832caf1ffe082c49b3878388df3ce97b7f0a49f9c4372b718c AS build
 WORKDIR /workspace
 
 # Wrapper and pom first: this layer and the dependency download only rerun when they change.
@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/root/.m2 \
 # The stock Temurin JRE image leaves out jdk.random, which RandomGenerator.getDefault() (used by the
 # provisioning RetryPolicy) needs. This runtime is the stock JRE module set plus jdk.random, minus the
 # remote debugger agent. It does not depend on the build stage, so code changes never rerun it.
-FROM eclipse-temurin:21.0.13_9-jdk-noble@sha256:114cabb73033ca4ce7ceec3deb62396bc1b716282bae051ed3c1d82e38fcab2d AS jre
+FROM eclipse-temurin:21.0.13.1_2-jdk-noble@sha256:4dea56dcfa1a89832caf1ffe082c49b3878388df3ce97b7f0a49f9c4372b718c AS jre
 RUN jlink \
       --add-modules java.se,jdk.random,jdk.unsupported,jdk.crypto.ec,jdk.crypto.cryptoki,jdk.charsets,jdk.localedata,jdk.zipfs,jdk.naming.dns,jdk.net,jdk.security.auth,jdk.security.jgss,jdk.management,jdk.management.agent,jdk.management.jfr,jdk.jfr,jdk.httpserver,jdk.nio.mapmode \
       --strip-debug \
@@ -59,7 +59,7 @@ RUN jlink \
 # ---------------------------------------------------------------------------------------------------
 # Stage 3: runtime
 # ---------------------------------------------------------------------------------------------------
-FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS runtime
+FROM ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289 AS runtime
 
 ARG VERSION=dev
 ARG REVISION=unknown
