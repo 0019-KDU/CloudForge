@@ -405,8 +405,7 @@ jobs:
           cache-dependency-path: backend/pom.xml
 
       - name: Resolve Maven dependencies
-        working-directory: backend
-        run: ./mvnw --batch-mode --no-transfer-progress dependency:resolve
+        run: .github/scripts/maven-resolve-with-retry.sh
 
       - name: Scan repository
         run: |

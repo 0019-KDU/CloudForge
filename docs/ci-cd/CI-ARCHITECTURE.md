@@ -166,7 +166,7 @@ On failure the script prints the container log. Both scripts also run locally (s
 Two implementation details that matter, both found while testing the jobs locally:
 
 - **Gitleaks can pass while scanning nothing.** The mounted checkout belongs to a different user than git inside the container, so git refuses it ("dubious ownership") and Gitleaks still exits 0. The jobs therefore pass a `safe.directory=/repo` exception through git's environment-based config, and a **guard fails the job if the range contains commits but Gitleaks reports scanning 0**.
-- **Trivy must not fetch Maven POMs itself.** Resolving `pom.xml` makes Trivy download every transitive POM from Maven Central, which answered `429 Too Many Requests`; shared runner IPs make that likely. The jobs first run `./mvnw dependency:resolve` into the cached local repository, mount it read-only into the container, and scan with `--offline-scan`.
+- **Trivy must not fetch Maven POMs itself.** Resolving `pom.xml` makes Trivy download every transitive POM from Maven Central, which answered `429 Too Many Requests`; shared runner IPs make that likely. The jobs first run `./mvnw dependency:resolve` into the cached local repository, mount it read-only into the container, and scan with `--offline-scan`. Maven itself can get the same 429 when the dependency cache misses (any `pom.xml` change) and several jobs download everything at once, so that step runs through `.github/scripts/maven-resolve-with-retry.sh`: 4 attempts, waiting 30, 60 and 120 s, each attempt keeping what the previous one downloaded.
 
 Trivy's secret scanner is **not** enabled on the repository, because Gitleaks already does that job;
 it is enabled on the built images, which Gitleaks can't see. Trivy IaC scanning
