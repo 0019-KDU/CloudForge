@@ -21,6 +21,9 @@
 		<aws-sdk.version>2.57.6</aws-sdk.version>
 		<google-cloud-resourcemanager.version>1.102.0</google-cloud-resourcemanager.version>
 		<kubernetes-client.version>27.0.1</kubernetes-client.version>
+		<!-- Transitive through kubernetes client-java (27.x ships 1.84: CVE-2026-8763, CVE-2026-13506).
+		     Remove this override once the Kubernetes client brings 1.85 or newer itself (client-java 28.x). -->
+		<bouncycastle.version>1.87</bouncycastle.version>
 	</properties>
 
 	<dependencyManagement>
@@ -32,6 +35,22 @@
 				<version>${aws-sdk.version}</version>
 				<type>pom</type>
 				<scope>import</scope>
+			</dependency>
+			<!-- Bouncy Castle has no BOM; the three artifacts must stay on the same version. -->
+			<dependency>
+				<groupId>org.bouncycastle</groupId>
+				<artifactId>bcprov-jdk18on</artifactId>
+				<version>${bouncycastle.version}</version>
+			</dependency>
+			<dependency>
+				<groupId>org.bouncycastle</groupId>
+				<artifactId>bcpkix-jdk18on</artifactId>
+				<version>${bouncycastle.version}</version>
+			</dependency>
+			<dependency>
+				<groupId>org.bouncycastle</groupId>
+				<artifactId>bcutil-jdk18on</artifactId>
+				<version>${bouncycastle.version}</version>
 			</dependency>
 		</dependencies>
 	</dependencyManagement>
