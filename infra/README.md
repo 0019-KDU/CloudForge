@@ -118,9 +118,7 @@ terraform output
 
 **5. Production:** the same as step 4, in `envs/production`. Apply it only when you need it, because it costs money.
 
-**6. GitHub:** create GitHub environments `staging` and `production` (Settings → Environments).
-- In each, add the variable `AWS_DEPLOY_ROLE_ARN` with that environment's `deploy_role_arn` output. It's a variable, not a secret, because an ARN isn't secret.
-- In `production`, add yourself as a **required reviewer**.
+**6. GitHub:** create the `staging` and `production` environments and the repository variables. The full list is in [CD-ARCHITECTURE.md, one-time GitHub setup](../docs/ci-cd/CD-ARCHITECTURE.md#one-time-github-setup-after-the-aws-infrastructure-exists). Setting `CD_STAGING_ENABLED=true` turns on automatic staging deployments.
 
 ## Day-2 operations
 

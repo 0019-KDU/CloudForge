@@ -488,3 +488,22 @@ jobs:
             exit 1
           fi
           echo "All required jobs passed."
+
+  # ---------------------------------------------------------------------------------------------
+  # Continuous delivery to staging: every push to main that passed every check is deployed with the
+  # exact images the images job built and tested in this run. Production is promoted manually
+  # (Actions → Deploy → Run workflow), behind the "production" environment's approval.
+  # Off until the AWS infrastructure exists: set the repository variable CD_STAGING_ENABLED=true.
+  # ---------------------------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to staging
+    needs: ci-required
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.CD_STAGING_ENABLED == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: staging
+      image_tag: ${{ github.sha }}
+      push_images: true
