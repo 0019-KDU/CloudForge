@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars (not committed) and adjust.
+
+# Commit SHA whose backend and frontend images are already in ECR (see infra/README.md, step 3).
+image_tag = "0123456789abcdef0123456789abcdef01234567"
+
+# First platform administrator; remove after the first sign-in.
+bootstrap_admin_email = "admin@example.com"
+
+# Optional custom domain. The certificate must be in us-east-1 (CloudFront requirement).
+# domain_name         = "staging.cloudforge.example.com"
+# acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/..."

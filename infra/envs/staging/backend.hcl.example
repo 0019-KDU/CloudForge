@@ -1,0 +1,5 @@
+# Copy to backend.hcl (not committed) and fill in from `terraform output` in infra/bootstrap/.
+#   terraform init -backend-config=backend.hcl
+bucket     = "cloudforge-tfstate-<account-id>-ap-south-1"
+region     = "ap-south-1"
+kms_key_id = "arn:aws:kms:ap-south-1:<account-id>:key/<key-id>"
