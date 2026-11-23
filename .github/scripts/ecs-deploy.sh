@@ -68,6 +68,8 @@ deploy_component() {
 
   current=$(aws ecs describe-task-definition --task-definition "$family" --query taskDefinition --output json)
   # Change the image only; drop the read-only fields describe returns but register rejects.
+  # $name and $image are jq variables, so the program is single-quoted on purpose.
+  # shellcheck disable=SC2016
   new_arn=$(jq --arg name "$component" --arg image "$image" '
       .containerDefinitions |= map(if .name == $name then .image = $image else . end)
       | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
@@ -76,12 +78,15 @@ deploy_component() {
         --query taskDefinition.taskDefinitionArn --output text)
   echo "Registered $new_arn"
 
+  # Backticks are JMESPath literals in the --query expressions, not command substitution.
+  # shellcheck disable=SC2016
   aws ecs update-service --cluster "$cluster" --service "$component" --task-definition "$new_arn" \
     --query 'service.deployments[?status==`PRIMARY`].id' --output text >/dev/null
 
   # Wait for the rollout to finish on the new revision, or detect a circuit-breaker rollback.
   local deadline=$((SECONDS + rollout_timeout_seconds)) primary_td state
   while ((SECONDS < deadline)); do
+    # shellcheck disable=SC2016
     read -r primary_td state < <(aws ecs describe-services --cluster "$cluster" --services "$component" \
       --query 'services[0].deployments[?status==`PRIMARY`] | [0].[taskDefinition, rolloutState]' --output text)
     if [[ "$primary_td" != "$new_arn" ]]; then
