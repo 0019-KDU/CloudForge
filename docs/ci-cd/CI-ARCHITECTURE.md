@@ -63,8 +63,8 @@ runs after `ci-required` succeeds; it never runs for a pull request.
 | Job | What it does | Runs when |
 |---|---|---|
 | `changes` | `git diff base...head` to decide whether backend and/or frontend changed, and which images to build | always |
-| `backend` | Java 21 (Temurin) + Maven wrapper: `./mvnw verify` | backend or workflow files changed; every push to `main` |
-| `frontend` | Node from `.nvmrc`: `npm ci`, `typecheck`, `lint`, `test:run`, `build` | frontend or workflow files changed; every push to `main` |
+| `backend` | Java 21 (Temurin) + Maven wrapper: `./mvnw verify` | backend or CI files changed; on `main`, any application or CI change |
+| `frontend` | Node from `.nvmrc`: `npm ci`, `typecheck`, `lint`, `test:run`, `build` | frontend or CI files changed; on `main`, any application or CI change |
 | `images` (matrix: `backend`, `frontend`) | Builds the component's production image from its `Dockerfile`, scans the built image with Trivy, generates a CycloneDX SBOM and runs the smoke test (section 4a) | same conditions as the component's job |
 | `secrets` | Gitleaks on the commits the PR/push adds | always |
 | `dependency-review` | Blocks PRs that **add** a dependency with a HIGH/CRITICAL advisory | pull requests |
@@ -76,7 +76,13 @@ runs after `ci-required` succeeds; it never runs for a pull request.
 ### Trigger conditions
 
 - **Pull requests to `main`:** full PR pipeline. A new commit cancels the PR's previous run (`concurrency`).
-- **Push to `main`** (a merge): everything runs regardless of paths, nothing is cancelled, build artifacts are stored, and (once enabled) staging is deployed.
+- **Push to `main`** (a merge), compared with the previous `main` commit:
+  - **any change in `backend/`, `frontend/` or the CI files:** everything runs (both stacks and both images, because a
+    deployment needs both images of the commit), nothing is cancelled, artifacts are stored and (once enabled)
+    staging is deployed;
+  - **docs- or Terraform-only:** only the security checks run. The change was fully tested in its pull request
+    (the ruleset requires an up-to-date branch) and changes no image, so nothing is built and nothing is deployed.
+  - no usable previous commit (new branch, force push): full validation.
 - **`workflow_dispatch`:** manual full run (useful after changing repository settings).
 - The workflows have **no workflow-level `paths:` filters**. That keeps `ci-required` reporting on every PR; path skipping is done per job (see section 7).
 
@@ -174,6 +180,9 @@ Two implementation details that matter, both found while testing the jobs locall
 
 - **Gitleaks can pass while scanning nothing.** The mounted checkout belongs to a different user than git inside the container, so git refuses it ("dubious ownership") and Gitleaks still exits 0. The jobs therefore pass a `safe.directory=/repo` exception through git's environment-based config, and a **guard fails the job if the range contains commits but Gitleaks reports scanning 0**.
 - **Trivy must not fetch Maven POMs itself.** Resolving `pom.xml` makes Trivy download every transitive POM from Maven Central, which answered `429 Too Many Requests`; shared runner IPs make that likely. The jobs first run `./mvnw dependency:resolve` into the cached local repository, mount it read-only into the container, and scan with `--offline-scan`. Maven itself can get the same 429 when the dependency cache misses (any `pom.xml` change) and several jobs download everything at once, so that step runs through `.github/scripts/maven-resolve-with-retry.sh`: 4 attempts, waiting 30, 60 and 120 s, each attempt keeping what the previous one downloaded.
+  Every `./mvnw` call in CI also gets longer per-request retries through `MAVEN_ARGS`
+  (`aether.transport.http.retryHandler.count=6`, `interval=10000`: waits of 10 s, 20 s … 60 s). Maven Resolver
+  retries 429 by default, but only 3 times within 30 s, which a rate-limit window outlasts.
 
 Trivy's secret scanner is **not** enabled on the repository, because Gitleaks already does that job;
 it is enabled on the built images, which Gitleaks can't see. Trivy's IaC checks cover the two
@@ -282,12 +291,12 @@ Decision rules (tested against 13 scenarios before merging, see section 11):
 | `failure` or `cancelled` | **fail** |
 | `changes` itself failed | **fail** (the stacks are then skipped, and that skip doesn't count as intended) |
 
-Path-based skipping is therefore safe: a docs-only PR skips both stacks and passes; a PR touching
+Path-based skipping is therefore safe: a docs-only PR (or merge) skips both stacks and passes; a PR touching
 `backend/` cannot pass without the backend job succeeding; a change to any workflow runs both stacks.
 
 ## 8. Main branch build
 
-On every push to `main` (the merged commit), all jobs run regardless of paths, and:
+On every push to `main` that changes the application or CI (see [Trigger conditions](#trigger-conditions)), all jobs run, and:
 
 | Artifact | Contents | Retention |
 |---|---|---|

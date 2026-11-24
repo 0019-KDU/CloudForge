@@ -19,6 +19,8 @@ env:
   GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
   TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
   ZIZMOR_IMAGE: ghcr.io/zizmorcore/zizmor:1.32.0@sha256:3014cc8f68f663935f69b3c3e0e41f5ce102b268d97db13db0f62208747f860d
+  # Longer Maven retries for HTTP 429 from Maven Central; see ci.yml.
+  MAVEN_ARGS: -Daether.transport.http.retryHandler.count=6 -Daether.transport.http.retryHandler.interval=10000
 
 jobs:
   # Every commit ever pushed, not just recent ones: catches secrets that slipped in before the PR
