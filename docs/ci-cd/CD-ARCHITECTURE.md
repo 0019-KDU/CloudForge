@@ -5,7 +5,7 @@ How a merged commit reaches staging and production. CI (build, test, scan, image
 and why it looks this way in [deployment-architecture.md](../operations/deployment-architecture.md).
 
 ```
-merge to main
+merge to main (application or CI change; docs/Terraform-only merges deploy nothing)
    └─► CI run (ci.yml): tests, scans, images built + smoke-tested ─► ci-required ✅
           └─► deploy-staging (calls deploy.yml)
                  push the run's tested images to ECR as :<commit-sha>

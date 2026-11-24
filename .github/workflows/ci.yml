@@ -29,6 +29,10 @@ env:
   TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
   ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
   ZIZMOR_IMAGE: ghcr.io/zizmorcore/zizmor:1.32.0@sha256:3014cc8f68f663935f69b3c3e0e41f5ce102b268d97db13db0f62208747f860d
+  # Maven Central rate-limits shared runner addresses (HTTP 429). Maven Resolver already retries 429,
+  # but by default only 3 times within 30 s. Retry 6 times with linearly growing waits (10 s, 20 s …
+  # 60 s; 3.5 minutes in total) so a rate-limit window passes. Read by every ./mvnw call (Maven ≥ 3.9).
+  MAVEN_ARGS: -Daether.transport.http.retryHandler.count=6 -Daether.transport.http.retryHandler.interval=10000
 
 jobs:
   # ---------------------------------------------------------------------------------------------
@@ -58,18 +62,40 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
         run: |
-          # Pushes to main and manual runs always validate everything.
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            echo "Full validation for $EVENT_NAME."
+          full() {
+            echo "Full validation: $1"
             { echo "backend=true"; echo "frontend=true"; echo 'images=["backend","frontend"]'; } >> "$GITHUB_OUTPUT"
             exit 0
-          fi
-          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
-          echo "Changed files:"
+          }
+          case "$EVENT_NAME" in
+            pull_request) range="$BASE_SHA...$HEAD_SHA" ;;
+            push)
+              # A new branch or a force push has no usable "before" commit.
+              if [[ -z "$PUSH_BEFORE" || "$PUSH_BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+                full "no previous commit to compare with"
+              fi
+              range="$PUSH_BEFORE..$PUSH_AFTER" ;;
+            *) full "manual run" ;;
+          esac
+          changed=$(git diff --name-only "$range")
+          echo "Changed files ($range):"
           while IFS= read -r file; do echo "  $file"; done <<<"$changed"
           # CI definitions affect every job, so a workflow change re-runs both stacks.
           shared='^(\.github/workflows/|\.github/actions/|\.github/scripts/)'
+          # On main every application change rebuilds and deploys BOTH images (a deployment needs both
+          # images of the commit). Docs- or Terraform-only merges were fully tested in their pull
+          # request and change no image, so only the cheap security checks run and nothing deploys.
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            if grep -qE "^(backend|frontend)/|$shared" <<<"$changed"; then
+              full "application or CI change on main"
+            fi
+            echo "No application or CI change: build, tests, images and deployment are skipped."
+            { echo "backend=false"; echo "frontend=false"; echo 'images=[]'; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           backend=false; frontend=false
           if grep -qE "^backend/|$shared" <<<"$changed"; then backend=true; fi
           if grep -qE "^frontend/|$shared" <<<"$changed"; then frontend=true; fi
@@ -102,11 +128,38 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-          cache: maven
-          cache-dependency-path: backend/pom.xml
+
+      # The Maven cache is saved by this job only: `verify` needs every plugin and test dependency,
+      # while the trivy job only resolves the runtime dependencies. (With setup-java's built-in cache
+      # both jobs shared one key, the faster trivy job saved first, and the incomplete cache made
+      # every backend run download all plugins from Maven Central, which answered HTTP 429.)
+      - name: Restore Maven cache
+        id: maven-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.m2/wrapper
+          key: maven-${{ runner.os }}-${{ hashFiles('backend/pom.xml', 'backend/.mvn/wrapper/maven-wrapper.properties') }}
+          # After a pom.xml change, start from the previous cache: only new artifacts are downloaded.
+          # The setup-java-* key bootstraps the first run from the caches setup-java saved before;
+          # remove that line once maven-* entries exist (caches unused for 7 days expire anyway).
+          restore-keys: |
+            maven-${{ runner.os }}-
+            setup-java-${{ runner.os }}-x64-maven-
 
       - name: Build and test (./mvnw verify)
         run: ./mvnw --batch-mode --no-transfer-progress verify
+
+      # Saved even when tests fail, so a red build never throws the downloads away.
+      - name: Save Maven cache
+        if: ${{ !cancelled() && steps.maven-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.m2/wrapper
+          key: maven-${{ runner.os }}-${{ hashFiles('backend/pom.xml', 'backend/.mvn/wrapper/maven-wrapper.properties') }}
 
       - name: Upload test reports
         if: ${{ !cancelled() }}
@@ -401,8 +454,22 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-          cache: maven
-          cache-dependency-path: backend/pom.xml
+
+      # Read-only: the backend job owns the Maven cache (see there).
+      - name: Restore Maven cache
+        id: maven-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.m2/wrapper
+          key: maven-${{ runner.os }}-${{ hashFiles('backend/pom.xml', 'backend/.mvn/wrapper/maven-wrapper.properties') }}
+          # After a pom.xml change, start from the previous cache: only new artifacts are downloaded.
+          # The setup-java-* key bootstraps the first run from the caches setup-java saved before;
+          # remove that line once maven-* entries exist (caches unused for 7 days expire anyway).
+          restore-keys: |
+            maven-${{ runner.os }}-
+            setup-java-${{ runner.os }}-x64-maven-
 
       - name: Resolve Maven dependencies
         run: .github/scripts/maven-resolve-with-retry.sh
@@ -497,8 +564,11 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   deploy-staging:
     name: Deploy to staging
-    needs: ci-required
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.CD_STAGING_ENABLED == 'true'
+    needs: [changes, ci-required]
+    # Only commits that built new images; a docs- or Terraform-only merge leaves staging as it is.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && vars.CD_STAGING_ENABLED == 'true' && needs.changes.outputs.images != '[]'
     permissions:
       contents: read
       id-token: write
