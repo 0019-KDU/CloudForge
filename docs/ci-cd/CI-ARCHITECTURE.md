@@ -9,16 +9,18 @@
 
 ## 1. Overview
 
-Three GitHub Actions workflows:
+Four GitHub Actions workflows:
 
 | Workflow | Triggers | Purpose | Blocks merges? |
 |---|---|---|---|
-| [`ci.yml`](../../.github/workflows/ci.yml) | PR to `main`, push to `main`, manual | Build, test, production images (build + scan + smoke test), secret scan, dependency and config scan, workflow lint; on `main` also store build artifacts | **Yes**, through `ci-required` |
-| [`codeql.yml`](../../.github/workflows/codeql.yml) | PR to `main`, push to `main`, weekly, manual | CodeQL SAST for Java and TypeScript, results in Code scanning | Not yet (advisory, see [CodeQL](#codeql)) |
+| [`ci.yml`](../../.github/workflows/ci.yml) | PR to `main`, push to `main`, manual | Build, test, production images (build + scan + smoke test), secret scan, dependency and config scan, workflow lint; on `main` also store build artifacts and deploy to staging | **Yes**, through `ci-required` |
+| [`codeql.yml`](../../.github/workflows/codeql.yml) | PR to `main`, push to `main`, weekly, manual | CodeQL SAST for Java and TypeScript, results in Code scanning | **Yes**, for new high/critical alerts (ruleset, see [CodeQL](#codeql)) |
+| [`deploy.yml`](../../.github/workflows/deploy.yml) | Called by `ci.yml` (staging), manual (production promotion, rollback) | Deploys a commit's tested images to an ECS environment; see [CD-ARCHITECTURE.md](CD-ARCHITECTURE.md) | No (runs after merge) |
 | [`security-scheduled.yml`](../../.github/workflows/security-scheduled.yml) | Weekly, manual | Full-history secret scan, full vulnerability scan to Code scanning, online workflow audits | No (alerts and notifications) |
 
 Supporting files: [`dependabot.yml`](../../.github/dependabot.yml), [`CODEOWNERS`](../../.github/CODEOWNERS),
-[`.gitleaks.toml`](../../.gitleaks.toml), [`.trivyignore.yaml`](../../.trivyignore.yaml), [`frontend/.nvmrc`](../../frontend/.nvmrc).
+[`.gitleaks.toml`](../../.gitleaks.toml), [`.trivyignore.yaml`](../../.trivyignore.yaml), [`frontend/.nvmrc`](../../frontend/.nvmrc),
+and the scripts in [`.github/scripts/`](../../.github/scripts/): image smoke tests, the Maven download retry, and the ECS deployment.
 
 ### Pull request pipeline
 
@@ -27,7 +29,7 @@ flowchart TD
     PR[Pull request to main] --> C[changes<br/>which stacks changed?]
     PR --> S[secrets<br/>Gitleaks on new commits]
     PR --> D[dependency-review<br/>new vulnerable deps]
-    PR --> T[trivy<br/>deps + Dockerfiles]
+    PR --> T[trivy<br/>deps, Dockerfiles, Terraform]
     PR --> W[workflows<br/>actionlint + zizmor]
     PR -.-> Q[CodeQL<br/>separate workflow, advisory]
 
@@ -47,10 +49,12 @@ flowchart TD
     R --> G{Every job succeeded<br/>or was intentionally skipped?}
     G -->|Yes| M[Eligible for review and merge]
     G -->|No| X[Fix the failing job]
+    M -.->|after merge, on main only| DS[deploy-staging<br/>deploy.yml, see CD-ARCHITECTURE.md]
 ```
 
 All jobs except `backend`, `frontend` and `images` start immediately and run in parallel; those wait
-only for the few-second `changes` job. `ci-required` waits for everything.
+only for the few-second `changes` job. `ci-required` waits for everything. On `main`, `deploy-staging`
+runs after `ci-required` succeeds; it never runs for a pull request.
 
 ## 2. Workflow responsibilities
 
@@ -64,14 +68,15 @@ only for the few-second `changes` job. `ci-required` waits for everything.
 | `images` (matrix: `backend`, `frontend`) | Builds the component's production image from its `Dockerfile`, scans the built image with Trivy, generates a CycloneDX SBOM and runs the smoke test (section 4a) | same conditions as the component's job |
 | `secrets` | Gitleaks on the commits the PR/push adds | always |
 | `dependency-review` | Blocks PRs that **add** a dependency with a HIGH/CRITICAL advisory | pull requests |
-| `trivy` | Fixable HIGH/CRITICAL vulnerabilities in `pom.xml`/`package-lock.json`, Dockerfile misconfigurations | always |
+| `trivy` | Fixable HIGH/CRITICAL vulnerabilities in `pom.xml`/`package-lock.json`; HIGH/CRITICAL misconfigurations in the Dockerfiles and the Terraform in `infra/` | always |
 | `workflows` | actionlint (incl. ShellCheck) and zizmor (offline) over `.github/workflows`; ShellCheck over `.github/scripts` | always |
 | `ci-required` | Aggregates all of the above into one status | always (`if: always()`) |
+| `deploy-staging` | Calls `deploy.yml`: pushes this run's tested images to ECR and rolls them out to the staging ECS services | push to `main`, after `ci-required` succeeded, when the repository variable `CD_STAGING_ENABLED` is `true` |
 
 ### Trigger conditions
 
 - **Pull requests to `main`:** full PR pipeline. A new commit cancels the PR's previous run (`concurrency`).
-- **Push to `main`** (a merge): everything runs regardless of paths, nothing is cancelled, and build artifacts are stored.
+- **Push to `main`** (a merge): everything runs regardless of paths, nothing is cancelled, build artifacts are stored, and (once enabled) staging is deployed.
 - **`workflow_dispatch`:** manual full run (useful after changing repository settings).
 - The workflows have **no workflow-level `paths:` filters**. That keeps `ci-required` reporting on every PR; path skipping is done per job (see section 7).
 
@@ -171,9 +176,10 @@ Two implementation details that matter, both found while testing the jobs locall
 - **Trivy must not fetch Maven POMs itself.** Resolving `pom.xml` makes Trivy download every transitive POM from Maven Central, which answered `429 Too Many Requests`; shared runner IPs make that likely. The jobs first run `./mvnw dependency:resolve` into the cached local repository, mount it read-only into the container, and scan with `--offline-scan`. Maven itself can get the same 429 when the dependency cache misses (any `pom.xml` change) and several jobs download everything at once, so that step runs through `.github/scripts/maven-resolve-with-retry.sh`: 4 attempts, waiting 30, 60 and 120 s, each attempt keeping what the previous one downloaded.
 
 Trivy's secret scanner is **not** enabled on the repository, because Gitleaks already does that job;
-it is enabled on the built images, which Gitleaks can't see. Trivy IaC scanning
-covers only the two Dockerfiles; there is no Terraform, Kubernetes or Helm in the repository, so no
-IaC jobs exist.
+it is enabled on the built images, which Gitleaks can't see. Trivy's IaC checks cover the two
+Dockerfiles and the Terraform in `infra/`, so an insecure infrastructure change (a public database,
+a missing WAF, an unencrypted state bucket) fails the pull request like a vulnerable dependency.
+There is no Kubernetes or Helm in the repository.
 
 ### Security policy
 
@@ -181,24 +187,27 @@ IaC jobs exist.
 |---|---|
 | Secret in a new commit (any Gitleaks rule) | **Blocks** (`secrets` job). Gitleaks does not verify secrets against providers, so every match is treated as real until proven otherwise. |
 | PR adds a dependency with a HIGH/CRITICAL advisory | **Blocks** (`dependency-review`, `fail-on-severity: high`) |
-| Fixable HIGH/CRITICAL vulnerability or Dockerfile misconfiguration anywhere in the repo | **Blocks** (`trivy`), unless baselined in `.trivyignore.yaml` |
+| Fixable HIGH/CRITICAL vulnerability, or HIGH/CRITICAL Dockerfile or Terraform misconfiguration, anywhere in the repo | **Blocks** (`trivy`), unless baselined in `.trivyignore.yaml` |
 | Fixable HIGH/CRITICAL vulnerability or a secret in a built image | **Blocks** (`images`), unless baselined in `.trivyignore.yaml` |
 | Image doesn't start or a smoke check fails | **Blocks** (`images`) |
 | Unfixable HIGH/CRITICAL, all MEDIUM/LOW | Reported weekly to Code scanning; not blocking |
-| CodeQL alerts | Reported on the PR and in Code scanning; advisory for now |
+| CodeQL alert, high or critical, introduced by the PR | **Blocks** (ruleset *Require code scanning results*); existing alerts don't |
+| Other CodeQL alerts | Reported on the PR and in Code scanning |
 | Workflow misconfiguration (zizmor) or broken workflow (actionlint) | **Blocks** (`workflows`) |
 
 **Baselines are explicit and expire.**
 
 - `.gitleaks.toml` allows two reviewed test fixtures. The JWT key is allowed only as that exact value in that one file; the password-policy test file is allowed by exact path.
-- `.trivyignore.yaml` lists accepted vulnerabilities, each with a statement and an `expired_at` date. When it expires the PR gate fails again, so the finding must be fixed or re-justified in a reviewed PR.
+- `.trivyignore.yaml` lists accepted vulnerabilities and misconfigurations, each with a statement and an `expired_at` date. When it expires the PR gate fails again, so the finding must be fixed or re-justified in a reviewed PR.
 - Both files are covered by CODEOWNERS.
 
-Current baseline (2026-11-03):
+Current baseline (2026-11-24):
 
 | ID | Component | Status |
 |---|---|---|
 | CVE-2026-102554 (HIGH) | `com.google.guava:guava` 33.6.0-jre (transitive) → fix 33.7.2 | Baselined until **2026-12-03**; upgrade via Dependabot |
+| AWS-0054 (CRITICAL) | Plain HTTP between CloudFront and the internal load balancer (`infra/modules/app/alb.tf`) | Accepted until **2027-05-23**: the load balancer has no public address and is reached through a CloudFront VPC origin; HTTPS on that hop needs a domain certificate |
+| AWS-0104 (CRITICAL) | HTTPS (443) egress to any address from the ECS tasks | Accepted until **2027-05-23**: the tasks call AWS and cloud-provider APIs with changing addresses; VPC endpoints would cost ~$58/month and can't cover non-AWS APIs |
 
 No `continue-on-error` is used anywhere.
 
@@ -206,7 +215,7 @@ No `continue-on-error` is used anywhere.
 
 - Languages `java-kotlin` and `javascript-typescript`, both with **`build-mode: none`**: CodeQL reads the source directly, so the analysis job runs no project code and needs no Maven or npm build.
 - Query suite `security-extended`, the same on every trigger, so PR and weekly results are comparable.
-- Findings don't fail the workflow. **Enforcement step, after triaging the first results:** add a repository ruleset with *Require code scanning results* (CodeQL, "High or higher" security alerts). GitHub then blocks merges that introduce new high/critical alerts without blocking on pre-existing ones.
+- **Enforced by the `protect-main` ruleset** (*Require code scanning results*: CodeQL, security alerts "High or higher", alerts "Errors"). GitHub blocks merges that introduce new high/critical alerts, without blocking on pre-existing ones. The workflow itself doesn't fail on findings; the ruleset decides.
 - Don't enable CodeQL **default setup** in repository settings at the same time; it conflicts with this advanced-setup workflow.
 
 ### Scheduled security
@@ -221,19 +230,22 @@ No `continue-on-error` is used anywhere.
 
 ## 6. Action and image pinning
 
-**Actions are pinned to full commit SHAs** (GitHub's and Docker's own; no community actions), resolved from the GitHub API on
-2026-11-03, following annotated tags down to the commit:
+**Actions are pinned to full commit SHAs**, from vendors only (GitHub, Docker, AWS; no community
+actions), resolved from the GitHub API and following annotated tags down to the commit. Current pins
+(2026-11-24, including Dependabot's updates):
 
 | Action | Version | Commit |
 |---|---|---|
 | `actions/checkout` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` |
-| `actions/setup-java` | v6.1.0 | `b843ebf9b913146b38da2eaa7aeddf76074ae1ad` |
+| `actions/setup-java` | v6.2.0 | `77dd5b2ce225ea11469928ac317850245a74ae78` |
 | `actions/setup-node` | v7.1.0 | `949feb2413d6458794dcd2491c4babbbce0c15c1` |
 | `actions/upload-artifact` | v7.0.2 | `cf430e030ddbb5b0abf93d22962f4752f3646cd9` |
+| `actions/download-artifact` (deploy: the run's tested images) | v8.0.2 | `9000827ccba6bdab643e8b6fd33ac0654aef8333` |
 | `actions/dependency-review-action` | v5.0.0 | `a1d282b36b6f3519aa1f3fc636f609c47dddb294` |
-| `github/codeql-action` (`init`, `analyze`, `upload-sarif`) | v4.39.1 | `9b3254085494b55a0f7c4c2b3d2d52cc712ce370` |
+| `github/codeql-action` (`init`, `analyze`, `upload-sarif`) | v4.39.3 | `33d7b85da1a04171e211befe2c739303b9a4c066` |
 | `docker/setup-buildx-action` (Docker's official action) | v4.4.1 | `f87e5991a6d7451dcb8d9637bfbc97413f497069` |
 | `docker/build-push-action` (Docker's official action; used build-only) | v7.4.0 | `c3c9e263c25d99ce0380d002d59b67737d91b0dc` |
+| `aws-actions/configure-aws-credentials` (AWS's official action; deploy only, OIDC) | v6.3.0 | `e1253824e5c10ff9df46874f81ed3ec929e19cfd` |
 
 **Third-party scanners run as official container images pinned by digest**, not through third-party
 actions:
@@ -252,7 +264,7 @@ Why containers:
 
 ### Updating pinned versions
 
-- **Actions:** Dependabot (`github-actions` ecosystem, weekly, 7-day cooldown) opens PRs that update the SHA and the version comment.
+- **Actions:** Dependabot (`github-actions` ecosystem, weekly, 7-day cooldown) opens PRs that update the SHA and the version comment. This table is a snapshot; the workflow files are the source of truth.
 - **Scanner images:** Dependabot doesn't update `docker run` references inside workflows. Update them quarterly or when a scanner release matters. Change the tag and the digest together; get the digest with `docker buildx imagetools inspect <image>:<tag>` (first `Digest:` line).
 
 ## 7. Aggregate required check (`ci-required`)
@@ -286,28 +298,39 @@ On every push to `main` (the merged commit), all jobs run regardless of paths, a
 | `backend-test-reports-<sha>`, `frontend-test-report-<sha>` | JUnit XML | 14 days |
 
 `build-info.json` records the component, commit SHA, ref, run ID, build time and toolchain version.
-Nothing is deployed and no image is pushed to a registry.
+When `CD_STAGING_ENABLED` is `true`, `deploy-staging` then pushes the two tested images to ECR as
+`:<commit-sha>` and deploys them to staging. Production is promoted by hand; see
+[CD-ARCHITECTURE.md](CD-ARCHITECTURE.md).
 
 ## 9. Branch protection recommendations
 
-Configure in **Settings → Rules → Rulesets** (or branch protection) for `main`. CI doesn't change these settings:
+Configure in **Settings → Rules → Rulesets** (or branch protection) for `main`. CI doesn't change these settings.
+In place (ruleset `protect-main`): pull request required (0 approvals while one person works on the
+repository), `ci-required` with up-to-date branches, code scanning results, no force pushes or deletions.
+Recommended once there are more contributors:
 
 1. Require a pull request before merging; at least 1 approval; dismiss stale approvals on new commits.
 2. Require review from Code Owners. With `CODEOWNERS`, changes to `.github/` and the scanner baselines need the owner's approval.
 3. Require status checks: **`ci-required`** only, with "Require branches to be up to date before merging".
 4. Block force pushes and deletions.
-5. After the first CodeQL baseline is triaged: *Require code scanning results*, CodeQL, security alerts "High or higher".
+5. *Require code scanning results*, CodeQL, security alerts "High or higher" (in place).
 6. Enable in **Settings → Code security**: Dependency graph (required by dependency review), Dependabot alerts, Dependabot security updates, Secret scanning and Push protection.
 7. **Settings → Actions → General:** workflow permissions "Read repository contents"; don't allow Actions to create or approve pull requests; for fork PRs, require approval for first-time contributors.
 
 ## 10. Secrets and permissions
 
-- **No secrets are used by any workflow.** The only credential is the automatic, short-lived `GITHUB_TOKEN`.
-- `permissions: {}` at workflow level; every job declares the minimum: `contents: read`, plus `security-events: write` only for the jobs that upload to Code scanning. `ci-required` has no permissions.
+- **No secrets are stored for any workflow.** The credentials are the automatic, short-lived `GITHUB_TOKEN`
+  and, in the deploy job only, 1-hour AWS credentials obtained through OIDC.
+- `permissions: {}` at workflow level; every job declares the minimum: `contents: read`, plus `security-events: write` only for the jobs that upload to Code scanning and `id-token: write` only for `deploy-staging` and the deploy job. `ci-required` has no permissions.
 - `actions/checkout` always uses `persist-credentials: false`, so the token isn't left in `.git/config` for later steps.
 - Event data (branch names, SHAs) reaches scripts only through `env:`, never by `${{ }}` interpolation inside `run:`, which prevents script injection.
 - `pull_request` (not `pull_request_target`): fork PRs run with a read-only token and no secrets.
-- No AWS, GCP or Kubernetes credentials exist in CI, and none are needed: tests use Testcontainers and scripted provider fakes.
+- The test and scan jobs have no cloud access at all: tests use Testcontainers and scripted provider fakes.
+- The deploy job assumes an IAM role through OIDC. The role trusts only this repository *and* the matching
+  GitHub environment (`repo:0019-KDU/CloudForge:environment:<env>`), so it gets AWS credentials only after
+  that environment's protection rules (e.g. production's required reviewer) have passed. Its permissions:
+  push/pull the two ECR repositories, register task definitions, update its own two ECS services. GCP and
+  Kubernetes credentials don't exist in CI.
 
 ## 11. Running the checks locally
 
@@ -375,32 +398,36 @@ git ls-files -s backend/mvnw      # must show 100755
 
 ## 13. Current limitations
 
-- **Not yet run on GitHub.** Validated locally: actionlint with ShellCheck and zizmor in their pinned containers; schema checks; the gating logic (20 scenarios) and the Gitleaks step (clean, leaked secret, refused repository) run as their exact scripts; `./mvnw verify` with all integration tests; the frontend steps; and every scanner container against a CI-equivalent checkout. Still unverified: real runner behaviour, timings, artifact uploads, Dependency Review and the CodeQL/SARIF uploads.
+- **The deployment path is unproven** until the AWS staging environment exists: `deploy-staging` is off (`CD_STAGING_ENABLED` unset), and `deploy.yml` has passed actionlint, ShellCheck and zizmor but has not deployed yet.
+- **zizmor's `self-repository` finding is suppressed** on the one local reusable-workflow call: GitHub's newer `$/` syntax isn't understood by actionlint 1.7.12 yet. Switch when it is.
 - **Dependency Review sees Maven direct dependencies only.** GitHub reads `pom.xml` statically. Transitive Maven vulnerabilities are caught by Trivy instead.
 - **Scanner image digests aren't updated by Dependabot** (see section 6).
 - **Trivy downloads its vulnerability database on every run** (~10–20 s) from GHCR; a GHCR outage fails the job, which is visible, not silent.
 - **No formatting or coverage gate** (no formatter or coverage tool configured yet).
 - **Gitleaks matches patterns; it doesn't verify** whether a secret is live. A false positive needs a reviewed allowlist entry.
 
-Measured locally (Windows laptop, warm caches, not a GitHub runner):
+Measured on GitHub-hosted runners (`main`, commit `81c0094`, 2026-11-24, warm caches):
 
-| Job | Local time |
+| Job | Time |
 |---|---|
-| backend `./mvnw verify` (207 unit + 84 integration tests) | 247 s |
-| frontend (typecheck, lint, tests, build) | 117 s |
-| Trivy (resolve 21 s + scan, incl. DB download) | ~165 s |
+| Image (backend): build, SBOM, scan, smoke test | 139 s |
+| Backend (`./mvnw verify`, 207 unit + 84 integration tests) | 95 s |
+| Frontend (typecheck, lint, tests, build) | 56 s |
+| Image (frontend) | 45 s |
+| Trivy (resolve + scan) | 30 s |
+| Gitleaks, workflow lint, change detection | 10–16 s each |
+| CodeQL (separate workflow): Java / TypeScript | 180 s / 53 s |
 
-All jobs run in parallel, so the PR wall time is roughly the backend job plus runner setup: within
-the 5–10 minute target if runners are comparable. Confirm with the first real runs (Actions → run →
-job durations) before tuning.
+All jobs run in parallel, so a pull request's CI finishes in about 2.5 minutes, set by the backend
+image job, and CodeQL in about 3 minutes. A cold cache (any `pom.xml` change) adds the Maven download.
 
 ## 14. Future improvements
 
-1. **Enforce CodeQL** with code scanning merge protection after the first triage (section 5).
-2. **Formatter checks:** Spotless (Java) and Prettier (frontend) in one dedicated reformatting PR, then a `--check` step.
-3. **Coverage:** JaCoCo + Vitest coverage published as artifacts; a threshold on *new* code once a baseline exists.
-4. **Maven dependency submission**, so Dependency Review also sees transitive Maven dependencies.
-5. **Merge queue** (`merge_group` trigger) once several people merge concurrently.
-6. **OpenSSF Scorecard** for repository-level security posture.
-7. **Image publishing** belongs to the future CD design: push to a registry by digest, sign (cosign, keyless OIDC) and attach the SBOM and provenance as attestations. CI already builds, scans and smoke-tests the images.
+1. **Formatter checks:** Spotless (Java) and Prettier (frontend) in one dedicated reformatting PR, then a `--check` step.
+2. **Coverage:** JaCoCo + Vitest coverage published as artifacts; a threshold on *new* code once a baseline exists.
+3. **Maven dependency submission**, so Dependency Review also sees transitive Maven dependencies.
+4. **Merge queue** (`merge_group` trigger) once several people merge concurrently.
+5. **OpenSSF Scorecard** for repository-level security posture.
+6. **Image signing and provenance:** images are now pushed to ECR by the deploy job; signing them (cosign, keyless OIDC) and attaching the SBOM and build provenance as attestations is the next supply-chain step.
+7. **Deploy by image digest:** task definitions reference the immutable ECR tag (`:<commit-sha>`); pinning `@sha256:…` would make the reference cryptographic.
 8. **Multi-arch images** (`linux/arm64`) if a deployment target needs them; CI builds `linux/amd64` only.
