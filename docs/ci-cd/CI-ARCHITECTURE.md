@@ -105,7 +105,13 @@ Checked in the effective POM rather than assumed. The Spring Boot parent binds f
 | verify | fails the build if any integration test failed |
 
 - No database service is configured and no real database is ever reachable. Each run gets throwaway containers from the runner's Docker.
-- Maven dependencies are cached by `actions/setup-java` (key: `backend/pom.xml`).
+- **Maven cache** (`~/.m2/repository` and the Maven distribution in `~/.m2/wrapper`), key: hash of `pom.xml` and the
+  wrapper properties. **Only this job saves it**, because `verify` needs every plugin and test dependency; the
+  `trivy` job and the weekly scan only restore it. It is saved even when tests fail, and after a `pom.xml` change
+  the previous cache is restored first, so only new artifacts are downloaded.
+  An earlier setup (setup-java's built-in cache in both jobs) shared one key; the faster `trivy` job always saved
+  first with an incomplete set, so every backend run downloaded all Maven plugins and hit Maven Central's
+  HTTP 429 rate limit.
 - Surefire and failsafe XML reports are uploaded as `backend-test-reports-<sha>` (14 days), including on failure.
 
 ## 4. Frontend validation

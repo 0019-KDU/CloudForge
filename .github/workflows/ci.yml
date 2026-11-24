@@ -128,11 +128,38 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-          cache: maven
-          cache-dependency-path: backend/pom.xml
+
+      # The Maven cache is saved by this job only: `verify` needs every plugin and test dependency,
+      # while the trivy job only resolves the runtime dependencies. (With setup-java's built-in cache
+      # both jobs shared one key, the faster trivy job saved first, and the incomplete cache made
+      # every backend run download all plugins from Maven Central, which answered HTTP 429.)
+      - name: Restore Maven cache
+        id: maven-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.m2/wrapper
+          key: maven-${{ runner.os }}-${{ hashFiles('backend/pom.xml', 'backend/.mvn/wrapper/maven-wrapper.properties') }}
+          # After a pom.xml change, start from the previous cache: only new artifacts are downloaded.
+          # The setup-java-* key bootstraps the first run from the caches setup-java saved before;
+          # remove that line once maven-* entries exist (caches unused for 7 days expire anyway).
+          restore-keys: |
+            maven-${{ runner.os }}-
+            setup-java-${{ runner.os }}-x64-maven-
 
       - name: Build and test (./mvnw verify)
         run: ./mvnw --batch-mode --no-transfer-progress verify
+
+      # Saved even when tests fail, so a red build never throws the downloads away.
+      - name: Save Maven cache
+        if: ${{ !cancelled() && steps.maven-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.m2/wrapper
+          key: maven-${{ runner.os }}-${{ hashFiles('backend/pom.xml', 'backend/.mvn/wrapper/maven-wrapper.properties') }}
 
       - name: Upload test reports
         if: ${{ !cancelled() }}
@@ -427,8 +454,22 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-          cache: maven
-          cache-dependency-path: backend/pom.xml
+
+      # Read-only: the backend job owns the Maven cache (see there).
+      - name: Restore Maven cache
+        id: maven-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.m2/wrapper
+          key: maven-${{ runner.os }}-${{ hashFiles('backend/pom.xml', 'backend/.mvn/wrapper/maven-wrapper.properties') }}
+          # After a pom.xml change, start from the previous cache: only new artifacts are downloaded.
+          # The setup-java-* key bootstraps the first run from the caches setup-java saved before;
+          # remove that line once maven-* entries exist (caches unused for 7 days expire anyway).
+          restore-keys: |
+            maven-${{ runner.os }}-
+            setup-java-${{ runner.os }}-x64-maven-
 
       - name: Resolve Maven dependencies
         run: .github/scripts/maven-resolve-with-retry.sh
